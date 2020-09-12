@@ -5,8 +5,8 @@
 #define NEGATIVE_INF -1 //(-inf, b)
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
-#define MAX_ITERATIONS 50
-#define MAX_ARRAY_LENGTH 100
+#define MAX_ITERATIONS 50 //Number of cycles allowed before quit
+#define MAX_ARRAY_LENGTH 100 //Allowed memory for holding subintervals
 #define MAX_SUBINTERVALS_ALLOWED 100
 #define MAX_DIVISIONS_ALLOCATED 50
 
@@ -24,6 +24,8 @@ typedef struct sintegral {
     double b; //right end point of interval
     double error; //error over the interval
     double result; //result over the interval
+    double resasc; //approximation of F-I/(B-A) over transformed integrand
+    double resabs; //approximation of the integral over the absolute value of the function
 } Subintegral;
 
 typedef struct extr {
@@ -52,22 +54,20 @@ __device__ double f(double x) {
 
 //Host Functions
 void flagError(Integrand*, int);
-void pqk15i(double, int, Subintegral*, double*, double*);
+void pqk15i(Subintegral*, double, int);
 void setvalues(Subintegral*, Integrand*, double, int, int);
 //Device Functions
 __device__ double dbl_atomicAdd(double*, double);
 
 void qagi(Integrand* integrand, int inf, double bound, double abserror_thresh, double relerror_thresh)
 {
-    Subintegral sublist[MAX_ARRARY_LENGTH]; //list containing left end point, right end points, result, and error estimate
+    Subintegral sublist[MAX_ARRAY_LENGTH]; //list containing left end point, right end points, result, and error estimate
     int errori; //index for the largest interval error estimate
     double maxerror; //the maximum error found so far
     double lasterror; //the previous error estimate
     double errorsum; //total error so far
     double errorbound; //the max error requested
     double resultsum; //total results
-    double resasc; //approximation of F-I/(B-A) over transformed integrand
-    double resabs; //approximation of the integral over the absolute value of the function
     int index; //Index for the current subinterval in the sublist
     int signchange; //logical variable indicating that there was a sign change over the interval
 
@@ -91,26 +91,26 @@ void qagi(Integrand* integrand, int inf, double bound, double abserror_thresh, d
     sublist[index].a = 0;
     sublist[index].b = 1;
     /* Parallel Gauss-Kronrod Quadrature */
-    pqk15i(bound, inf, sublist, &resabs, &resasc);
+    pqk15i(sublist, bound, inf);
     /* Set result and error as sum of all results and errors */
-    resultsum = sublist[index].result
+    resultsum = sublist[index].result;
     errorsum = sublist[index].error;
     errori = index;
 
     /* Test of Accuracy */
     errorbound = MAX(abserror_thresh, relerror_thresh * ABS(resultsum));
 
-    if (errorsum <= 100 * DBL_EPSILON * resabs && errorbound < errorsum) //checks if round off error and if the error is above threshhold
+    if (errorsum <= 100 * DBL_EPSILON * sublist[index].resabs && errorbound < errorsum) //checks if round off error and if the error is above threshhold
         flagError(integrand, ROUNDOFF_ERROR);
     if (index == MAX_ITERATIONS - 1)
         flagError(integrand, MAX_ITERATIONS_ALLOWED);
-    if (integrand->ier != 0 || (errorsum <= errorbound && errorsum != resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
+    if (integrand->ier != 0 || (errorsum <= errorbound && errorsum != sublist[index].resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
         integrand->result = resultsum;
         integrand->evaluations = (inf == BOTH_INF) ? 2 * (15 + index * 30) : 15 + index * 30;
         integrand->abserror = errorsum;
         return;
     }
-    if ((1 - DBL_EPSILON / 2) * resabs <= ABS(resultsum))
+    if ((1 - DBL_EPSILON / 2) * sublist[index].resabs <= ABS(resultsum))
         signchange = 0;
     else
         signchange = 1;
@@ -134,8 +134,8 @@ void qagi(Integrand* integrand, int inf, double bound, double abserror_thresh, d
     integrand->iroff2 = 0;
     integrand->iroff3 = 0;
     maxerror = errorsum;
-    integrand.extrap = 0;
-    integrand.noext = 0;
+    integrand->extrap = 0;
+    integrand->noext = 0;
     ktmin = 0;
     nextit = 0;
 
@@ -182,68 +182,63 @@ __device__ double dbl_atomicAdd(double* address, double val)
         resasc -  the integral of the value of the integral
                   subtracted by the mean value of the integral
 */
-__global__ void CUDA_qk15i(double, int, Subintegral*, double*, double*);
+__global__ void CUDA_qk15i(double, int, Subintegral*);
 
-void pqk15i(double bound, int inf, Subintegral* interval, double* resabs, double* resasc) {
+void pqk15i(Subintegral* interval, double bound, int inf) {
     
     /* Allocate memory space to the GPU */
-    double* d_interval; cudaMalloc((void**)&d_interval, sizeof(Subintegral));
-    double* d_resabs; cudaMalloc((void**)&d_resabs, sizeof(double));
-    double* d_resasc; cudaMalloc((void**)&d_resasc, sizeof(double));
+    Subintegral* d_interval; cudaMalloc((void**)&d_interval, sizeof(Subintegral));
+    /* Copy host memory to device */
+    cudaMemcpy(d_interval, interval, sizeof(Subintegral), cudaMemcpyHostToDevice);
     /* Perform  Gaussian-Kronrod Quadrature */
-    CUDA_qk15i << <1, 15 >> > (bound, inf, interval, d_resabs, d_resasc);
+    CUDA_qk15i << <1, 15 >> > (bound, inf, d_interval);
     /* Copy results back to host variables */
     cudaMemcpy(interval, d_interval, sizeof(Subintegral), cudaMemcpyDeviceToHost);
-    cudaMemcpy(resabs, d_resabs, sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(resasc, d_resasc, sizeof(double), cudaMemcpyDeviceToHost);
     /* Free Memory */
-    cudaFree(d_interval); cudaFree(d_resabs); cudaFree(d_resasc);
+    cudaFree(d_interval);
 }
 
-typedef struct interv {
-    Subintegral interval; //Container holding a, b, result, and error
-    double resasc; //the integral of I - I/(A-B)
-    double resabs; //the integral of the absolute value of the function
-} Part;
-
-__global__ void qk15i(double, double, Part*, int, int, int);
+__global__ void qk15i(Subintegral, Subintegral*, int, int, int);
 __device__ int findDivisions(double, double, int);
+__device__ double sumResults(Subintegral*, int);
+__device__ double sumError(Subintegral*, int);
+__device__ int checkRoundOff(Subintegral*, int);
 
-__device__ Part* allocmem[MAX_SUBINTERVALS_ALLOWED]; //Array of allocated memory for each subinterval
+__device__ Subintegral* allocmem[MAX_SUBINTERVALS_ALLOWED]; //Array of allocated memory for each subinterval
 __device__ int allocl = 0; //Length of allocmem
 
-__global__ void dqk15i(Integrand* integrand, Subintegral* list, int bound, int inf, double* errorsum, double* resultsum, double maxerror, int index)
+__global__ void dqk15i(Integrand* integrand, Subintegral* list, int bound, int inf, double* errorsum, double* resultsum, int index)
 {
     int tindex; //Unique Thread index
     int divisions; //Amount of divisions allocated to subinterval
     double toterror; //total error over subinterval
     double totresult; //total result over the interval
-    Part* results; //memory for each subsection of the subinterval
+    Subintegral* results; //memory for each subsection of the subinterval
 
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
     /* Find the amount of divisions and allocate amount of corresponding memory */
     divisions = findDivisions(list[tindex].error, *errorsum, MAX_DIVISIONS_ALLOCATED); 
-    cudaMalloc((void**)&results, sizeof(Part) * divisions);
+    cudaMalloc((void**)&results, sizeof(Subintegral) * divisions);
     /* Perform Dynamic Gauss-Kronrod Quadrature*/
-    qk15i <<<divisions, 1>>> (list[tindex].a, list[tindex].b, results, bound, inf, divisions);
+    qk15i <<<divisions, 1>>> (list[tindex], results, bound, inf, divisions);
 
     /* Improve previous approximations to integral and error and test for accuracy  */
-    totresult = result1 + result2;
-    toterror = error1 + error2;
-    dbl_atomicAdd(error, toterror - maxerror);
+    totresult = sumResults(results, divisions);
+    toterror = sumError(results, divisions);
+    dbl_atomicAdd(errorsum, toterror - list[tindex].error);
     dbl_atomicAdd(resultsum, totresult - list[tindex].result);
  
-    errorbound = MAX(abserror_thresh, relerror_thresh * ABS(resultsum));//move outside function
+    //errorbound = MAX(abserror_thresh, relerror_thresh * ABS(resultsum)); move outside function
 
     //Checking roundoff error
-    if (resasc1 != error1 && resasc2 != error2) {
+    if (checkRoundOff(results, divisions)) {
         if (ABS(list[tindex].result - totresult) <= 1.0E-05 * ABS(totresult)
-            && 9.9E-01 * maxerror <= toterror)
+            && 9.9E-01 * list[tindex].error <= toterror)
             if (integrand->extrap)
                 atomicAdd(&(integrand->iroff2), 1);
             else
                 atomicAdd(&(integrand->iroff1), 1);
-        if (index > 10 && maxerror < toterror)
+        if (index > 10 && list[tindex].error < toterror)
             atomicAdd(&(integrand->iroff3), 1);
     }
     //Set error flags - move all these out of function
@@ -258,23 +253,23 @@ __global__ void dqk15i(Integrand* integrand, Subintegral* list, int bound, int i
 }
 
 
-__global__ void qk15i(double a, double b, Part* results, int bound, int inf, int divisions)
+__global__ void qk15i(Subintegral initial, Subintegral* interval, int bound, int inf, int divisions)
 {
     double delx; //the distance inbetween each point evaluated
     int tindex; //unique thread identifier
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
-    delx = (b - a) / divisions;
+    delx = (initial.b - initial.a) / divisions;
     /* Creating interval to be disected */
-    results[tindex].interval.a = delx * tindex; 
-    results[tindex].interval.b = delx * (tindex + 1);
+    interval[tindex].a = delx * tindex; 
+    interval[tindex].b = delx * (tindex + 1);
     /* Multiple Gauss-Kronrod Quadrature */
-    CUDA_qk15i <<<1, 15>>> (bound, inf, &(results[tindex].interval), &(results[tindex].resabs), &(results[tindex].resasc));
+    CUDA_qk15i <<<1, 15>>> (bound, inf, interval + tindex);
 }
 
 /*
     CUDA translated 15-point Gauss Quadrature
 */
-__global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval, double* resabs, double* resasc)
+__global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 {
     double xk[] = { //arguments for Gauss-Kronod quadrature
         0.0, 9.491079123427585E-01,
@@ -307,8 +302,8 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval, double*
     int sign; //Determines if shifted argument is shifted right or left, determined by index
 
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
-    sign = (index > 7) ? -1 : 1; //If above 7, shift argument left, else shift right
-    tindex -= (index > 7) ? 7 : 0; //Index's above 7 share same elements with the index 7 behind it
+    sign = (tindex > 7) ? -1 : 1; //If above 7, shift argument left, else shift right
+    tindex -= (tindex > 7) ? 7 : 0; //Index's above 7 share same elements with the index 7 behind it
     dinf = MIN(1, inf);
     hlength = (interval->b - interval->a) / 2;
     center = (interval->a + interval->b) / 2;
@@ -341,16 +336,16 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval, double*
 
     if (tindex == 0) {
         interval->result = resultk * hlength;
-        *resasc = resultasc * hlength;
-        *resabs = resulta * hlength;
+        interval->resasc = resultasc * hlength;
+        interval->resabs = resulta * hlength;
 
         /* Calculating error */
-        interval->abserr = ABS((resultk - resultg) * hlength);
+        interval->error = ABS((resultk - resultg) * hlength);
 
-        if (*resasc != 0 && *abserr != 0) //traditonal way to calculate error
-            interval->abserr = *resasc * MIN(1, pow(200 * *abserr / *resasc, 1.5));
-        if (*resabs > DBL_MIN / (DBL_EPSILON * 50)) //Checks roundoff error
-            interval->abserr = MAX((DBL_EPSILON / 50) * *resabs, *abserr);
+        if (interval->resasc != 0 && interval->error != 0) //traditonal way to calculate error
+            interval->error = interval->resasc * MIN(1, pow(200 * interval->error / interval->resasc, 1.5));
+        if (interval->resabs > DBL_MIN / (DBL_EPSILON * 50)) //Checks roundoff error
+            interval->error = MAX((DBL_EPSILON / 50) * interval->resabs, interval->error);
     }
 }
 
@@ -358,6 +353,30 @@ __device__ int findDivisions(double error, double errorsum, int maxallowed) {
 
     return (int)(((error / errorsum) * maxallowed < 2) ? (error / errorsum) * maxallowed : 2);
 
+}
+
+__device__ double sumResults(Subintegral* results, int num)
+{
+    double res;
+    for (int i = 0; i < num; i++)
+        res += results[i].result;
+    return res;
+}
+
+__device__ double sumError(Subintegral* results, int num)
+{
+    double err;
+    for (int i = 0; i < num; i++)
+        err += results[i].error;
+    return err;
+}
+
+__device__ int checkRoundOff(Subintegral* results, int num)
+{
+    for (int i = 0; i < num; i++)
+        if (results[i].resasc == results[i].error)
+            return 0;
+    return 1;
 }
 
 /*
@@ -397,16 +416,17 @@ void setvalues(Subintegral* list, Integrand* integrand, double errorsum, int ind
 
 int main()
 {
-    Subintegral integral;
-    integral.a = 0;
-    integral.b = 1;
-    Part results[10];
-    Part* d_results;
+    Subintegral initial;
+    initial.a = 0;
+    initial.b = 1;
+    Subintegral results[10];
+    Subintegral* d_results;
 
-    cudaMalloc((void**)&d_results, sizeof(Part)*10);
-    qk15i<<<10, 1>>>(0, BOTH_INF, 10, integral, d_results);
-    cudaMemcpy(results, d_results, sizeof(Part)*10, cudaMemcpyDeviceToHost);
-
+    
+    cudaMalloc((void**)&d_results, sizeof(Subintegral)*10);
+    qk15i<<<10, 1>>>(initial, d_results, 0, BOTH_INF, 10);
+    cudaMemcpy(results, d_results, sizeof(Subintegral)*10, cudaMemcpyDeviceToHost);
+    
     double result = 0;
     for (int i = 0; i < 10; i++)
         result += results[i].result;
