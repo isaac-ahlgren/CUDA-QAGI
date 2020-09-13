@@ -6,9 +6,8 @@
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 50 //Number of cycles allowed before quit
-#define MAX_ARRAY_LENGTH 100 //Allowed memory for holding subintervals
-#define MAX_SUBINTERVALS_ALLOWED 100
-#define MAX_DIVISIONS_ALLOCATED 50
+#define MAX_SUBINTERVALS_ALLOWED 10
+#define MAX_TOTALDIVISIONS_ALLOWED 10
 
 #define ABS(x) ((x < 0) ? -x : x)
 #define MAX(x, y) ((x < y) ? y : x)
@@ -61,7 +60,7 @@ __device__ double dbl_atomicAdd(double*, double);
 
 void qagi(Integrand* integrand, int inf, double bound, double abserror_thresh, double relerror_thresh)
 {
-    Subintegral sublist[MAX_ARRAY_LENGTH]; //list containing left end point, right end points, result, and error estimate
+    Subintegral sublist[MAX_SUBINTERVALS_ALLOWED]; //list containing left end point, right end points, result, and error estimate
     int errori; //index for the largest interval error estimate
     double maxerror; //the maximum error found so far
     double lasterror; //the previous error estimate
@@ -199,7 +198,7 @@ void pqk15i(Subintegral* interval, double bound, int inf) {
 }
 
 __global__ void qk15i(Subintegral, Subintegral*, int, int, int);
-__device__ int findDivisions(double, double, int);
+__device__ int findDivisions(double, double, int, int);
 __device__ double sumResults(Subintegral*, int);
 __device__ double sumError(Subintegral*, int);
 __device__ int checkRoundOff(Subintegral*, int);
@@ -217,7 +216,7 @@ __global__ void dqk15i(Integrand* integrand, Subintegral* list, int bound, int i
 
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
     /* Find the amount of divisions and allocate amount of corresponding memory */
-    divisions = findDivisions(list[tindex].error, *errorsum, MAX_DIVISIONS_ALLOCATED); 
+    divisions = findDivisions(list[tindex].error, *errorsum, index, MAX_TOTALDIVISIONS_ALLOWED);
     cudaMalloc((void**)&results, sizeof(Subintegral) * divisions);
     /* Perform Dynamic Gauss-Kronrod Quadrature*/
     qk15i <<<divisions, 1>>> (list[tindex], results, bound, inf, divisions);
@@ -349,15 +348,21 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
     }
 }
 
-__device__ int findDivisions(double error, double errorsum, int maxallowed) {
+/* 
+    Could be optimized better, has a tendancy to pick
+    maxallowed-1 divisions over maxallowed because of
+    truncation.
+*/
+__device__ int findDivisions(double error, double errorsum, int index, int maxallowed) {
 
-    return (int)(((error / errorsum) * maxallowed < 2) ? (error / errorsum) * maxallowed : 2);
+    int allowed = maxallowed - ((index + 1) * 2) + 1; //Amount of extra divisions to be distributed  
+    return (int) ((error / errorsum) * allowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
 
 }
 
 __device__ double sumResults(Subintegral* results, int num)
 {
-    double res;
+    double res = 0;
     for (int i = 0; i < num; i++)
         res += results[i].result;
     return res;
@@ -365,7 +370,7 @@ __device__ double sumResults(Subintegral* results, int num)
 
 __device__ double sumError(Subintegral* results, int num)
 {
-    double err;
+    double err = 0;
     for (int i = 0; i < num; i++)
         err += results[i].error;
     return err;
@@ -414,15 +419,23 @@ void setvalues(Subintegral* list, Integrand* integrand, double errorsum, int ind
     integrand->abserror = errorsum;
 }
 
+__global__ void test(Subintegral* list, double errorsum, int index)
+{
+    int tindex = tindex = threadIdx.x + blockIdx.x * blockDim.x;
+    int div = findDivisions(list[tindex].error, errorsum, index, 30);
+    printf("%f %d\n", list[tindex].error, div);
+}
+
 int main()
 {
+    /*
     Subintegral initial;
     initial.a = 0;
     initial.b = 1;
     Subintegral results[10];
     Subintegral* d_results;
-
-    
+    */
+    /*
     cudaMalloc((void**)&d_results, sizeof(Subintegral)*10);
     qk15i<<<10, 1>>>(initial, d_results, 0, BOTH_INF, 10);
     cudaMemcpy(results, d_results, sizeof(Subintegral)*10, cudaMemcpyDeviceToHost);
@@ -432,5 +445,38 @@ int main()
         result += results[i].result;
 
     printf("%f\n", result);
+    */
+
+    Subintegral list[30];
+    /*
+    list[0].error = 8922.3440895228996;
+    list[1].error = 24.824634333689687;
+    list[2].error = 0.014152200425590322;
+    list[3].error = 1.2654399636772547e-07;
+    list[4].error = 5.9988279370659382e-08;
+    list[5].error = 5.133955049180035e-08;
+    list[6].error = 2.6745188194879989e-09;
+    list[7].error = 1.6867272160903006e-10;
+    list[8].error = 1.6826417701967357e-11;
+    list[9].error = 9.4300300284172862e-15;
+    */
+    //double errorsum = 8947.1828762977511;
+    /*
+    list[0].error = 2130.3232293756005;
+    list[1].error = 2.6745188194879989e-09;
+    */
+    //double errorsum = 2130.3232293782748;
+
+    list[0].error = 100;
+    list[1].error = 150;
+    list[2].error = 300;
+    list[3].error = 500;
+    double errorsum = 1050;
+    int index = 3;
+    Subintegral* d_interval; cudaMalloc((void**)&d_interval, sizeof(Subintegral)*30);
+    cudaMemcpy(d_interval, list, sizeof(Subintegral)*30, cudaMemcpyHostToDevice);
+    test <<<1, 4 >>> (d_interval, errorsum, index);
+    cudaFree(d_interval);
+
     
 }
