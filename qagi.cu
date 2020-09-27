@@ -493,7 +493,6 @@ __global__ void flag(Subintegral* results, int index, double errorbound, int* ns
         results[tindex].skimmed = 1;
         atomicAdd(nskimmed, 1);
     }
-    else results[tindex].skimmed = 0;
 }
 
 /*
@@ -662,9 +661,10 @@ int main()
     /* Set first interval to (1,0) */
     setInterval<<<1,1>>>(device.list);
     /* Parallel Gauss-Kronrod Quadrature */
-    fqk15i(device, 0, BOTH_INF, &resultsum, &errorsum);
-
-    wqk15i(device, &integrand, 0, BOTH_INF, &index, 0, 0, &errorsum, &resultsum);
+    fqk15i(device, 0, POSITIVE_INF, &resultsum, &errorsum);
+    double errorbound = MAX(0, 0 * ABS(resultsum));
+    //if (errorsum <= errorbound)
+        //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
     Subintegral list[MAX_SUBINTERVALS_ALLOWED];
     cudaMemcpy(list, device.list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED, cudaMemcpyDeviceToHost);
 
