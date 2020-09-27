@@ -66,7 +66,7 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  1 / (1 + (x * x));
+    return  x;//1 / (1 + (x * x));
 }
 
 void flagError(Integrand*, int);
@@ -493,6 +493,7 @@ __global__ void flag(Subintegral* results, int index, double errorbound, int* ns
         results[tindex].skimmed = 1;
         atomicAdd(nskimmed, 1);
     }
+    else results[tindex].skimmed = 0;
 }
 
 /*
@@ -536,8 +537,9 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
             while (slength > 0) {
                 if (!nslist[length].skimmed) {
                     slist[slength-1] = nslist[length-1];
-                    slength--; length--;
+                    slength--;
                 }
+                length--;
             }
         }
     }
