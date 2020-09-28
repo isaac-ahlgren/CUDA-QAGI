@@ -8,9 +8,9 @@
 #define MAX_SUBINTERVALS_ALLOWED 10
 #define MAX_TOTALDIVISIONS_ALLOWED 10
 
-#define ABS(x) ((x < 0) ? -x : x)
-#define MAX(x, y) ((x < y) ? y : x)
-#define MIN(x, y) ((x < y) ? x : y)
+#define ABS(x) (((x) < 0) ? (-x) : (x))
+#define MAX(x, y) (((x) < (y)) ? (y) : (x))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
 enum {
     NORMAL, MAX_ITERATIONS_ALLOWED = 0x1, ROUNDOFF_ERROR = 0x2, BAD_INTEGRAND_BEHAVIOR = 0x4,
@@ -53,7 +53,7 @@ typedef struct res {
     double totalerror;
     double totalresult;
     int divisions;
-    int nskimmed; 
+    int nskimmed;
 } Result;
 
 typedef struct dev {
@@ -71,6 +71,9 @@ __device__ double f(double x) {
 
 void flagError(Integrand*, int);
 void setvalues(Subintegral*, Integrand*, double, int, int);
+__host__ __device__ double _max(double a, double b);
+__host__ __device__ double _min(double a, double b);
+__host__ __device__ double _abs(double a);
 
 /*
     Evaluates initial interval using parallelized Gauss-Kronrod
@@ -82,7 +85,7 @@ void setvalues(Subintegral*, Integrand*, double, int, int);
         bound - finite bound for semi-infinite integrals.
                 Default is 0.
         inf - constant used to denote which direction the
-                integral is infinite 
+                integral is infinite
         errorsum - total error over the entire list
         resultsum - total results over the entire list
 */
@@ -93,13 +96,13 @@ __global__ void setTotals(Subintegral*, double*, double*);
 void fqk15i(Device device, int bound, int inf, double* resultsum, double* errorsum)
 {
     /* Perform Initial Gauss-Kronrod Calculation */
-    CUDA_qk15i <<<1, 15>>> (bound, inf, device.list);
+    CUDA_qk15i << <1, 15 >> > (bound, inf, device.list);
     /* Copy result and error to device side total error and results */
-    setTotals<<<1,1>>>(device.list, device.totalerror, device.totalresult);
+    setTotals << <1, 1 >> > (device.list, device.totalerror, device.totalresult);
     /* Copy result and error to host side total error and results */
     cudaMemcpy(resultsum, &device.list[0].result, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(errorsum, &device.list[0].error, sizeof(double), cudaMemcpyDeviceToHost);
-    
+
 }
 
 /*
@@ -118,7 +121,7 @@ void fqk15i(Device device, int bound, int inf, double* resultsum, double* errors
         bound - finite bound for semi-infinite integrals.
                 Default is 0.
         inf - constant used to denote which direction the
-                integral is infinite 
+                integral is infinite
         index - current index of list
         abserr_thresh - absolute error threshold
         relerr_thresh - relative error threshold
@@ -139,12 +142,12 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
 
     /* Perform Dynamic Gauss-Kronrod Quadrature */
-    dqk15i <<<oindex+1, 1>>> (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
+    dqk15i << <oindex + 1, 1 >> > (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
     /* Check round off error */
-    checkRoundOff <<<oindex+1, 1>>> (device.integrand, device.result, oindex, device.index);
+    checkRoundOff << <oindex + 1, 1 >> > (device.integrand, device.result, oindex, device.index);
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
-    skimValues <<<oindex+1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
+    skimValues << <oindex + 1, 1 >> > (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
 
     /* Copy results necissary to the CPU side */
     cudaMemcpy(index, device.index, sizeof(int), cudaMemcpyDeviceToHost);
@@ -155,11 +158,11 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
 
 /*
     Uses multiple threads to launch Gauss-Kronrod Quadrature over
-    every interval. Each interval gets a dynamically allocated 
+    every interval. Each interval gets a dynamically allocated
     amount of divisions with each one getting at least 2. These
     results are then appended to rlist and used checkRoundOff and
     skimValues.
-    
+
     Parameters:
         list - list of device sided intervals to be divided
         rlist - list of results from original intervals that are
@@ -167,7 +170,7 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
         bound - finite bound for semi-infinite integrals.
                 Default is 0.
         inf - constant used to denote which direction the
-                integral is infinite 
+                integral is infinite
         oindex - original index before Gauss-Krondrod Quadrature
         nindex - new index after Gauss-Kronrod Quadrature
         errorsum - total error over the entire list
@@ -199,17 +202,17 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
         original = list[tindex];
         /* Find the amount of divisions and allocate amount of corresponding memory */
         divisions = findDivisions(list[tindex].error, *errorsum, oindex, MAX_TOTALDIVISIONS_ALLOWED);
-        memindex = alloclist(allocmem, nindex, divisions); 
+        memindex = alloclist(allocmem, nindex, divisions);
         /* Perform Dynamic Gauss-Kronrod Quadrature*/
-        qk15i <<<divisions, 1>>> (original, memindex, bound, inf, divisions);
+        qk15i << <divisions, 1 >> > (original, memindex, bound, inf, divisions);
         cudaDeviceSynchronize();
-    
-    /* Improve previous approximations to integral and error and test for accuracy  */
+
+        /* Improve previous approximations to integral and error and test for accuracy  */
         totresult = sumResults(memindex, divisions);
         toterror = sumError(memindex, divisions);
         dbl_atomicAdd(errorsum, toterror - original.error);
         dbl_atomicAdd(resultsum, totresult - original.result);
-    /* Append results to interfunctional list */
+        /* Append results to interfunctional list */
         rlist[tindex].original = original;
         rlist[tindex].results = memindex;
         rlist[tindex].totalresult = totresult;
@@ -230,10 +233,10 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
                 used in other kernels
         oindex - original index of list
         nindex - new index of list
-*/ 
+*/
 __device__ int checkRO(Subintegral*, int);
 
-__global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, int* nindex) 
+__global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, int* nindex)
 {
     int tindex; //Unique Thread index
     int divisions; //Amount of divisions allocated to subinterval
@@ -243,7 +246,7 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
     Subintegral* list; //Position in global memory to return results
 
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
-    
+
     if (tindex <= oindex) {
         divisions = rlist[tindex].divisions;
         toterror = rlist[tindex].totalerror;
@@ -269,7 +272,7 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
     one interval. The amount is dependent on amount of
     divisions allocated in dqk15i. First divides initial
     interval, performs Gauss-Kronrod Quadrature, then puts
-    result into array of Subintegrals. 
+    result into array of Subintegrals.
 
     Parameters:
         intitial - intitial interval to be divided
@@ -277,7 +280,7 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
         bound - finite bound for semi-infinite integrals.
                 Default is 0.
         inf - constant used to denote which direction the
-                integral is infinite 
+                integral is infinite
         divisions - number of divisions to be done on the
                     initial interval
 */
@@ -290,10 +293,10 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
     delx = (initial.b - initial.a) / divisions;
     /* Creating interval to be disected */
-    list[tindex].a = delx * tindex; 
+    list[tindex].a = delx * tindex;
     list[tindex].b = delx * (tindex + 1);
     /* Multiple Gauss-Kronrod Quadrature */
-    CUDA_qk15i <<<1, 15>>> (bound, inf, list + tindex);
+    CUDA_qk15i << <1, 15 >> > (bound, inf, list + tindex);
 }
 
 /*
@@ -303,7 +306,7 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
         bound - finite bound for semi-infinite integrals.
                 Default is 0.
         inf - constant used to denote which direction the
-                integral is infinite 
+                integral is infinite
         interval - interval to be evaluated
 */
 __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
@@ -341,7 +344,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
     sign = (tindex > 7) ? -1 : 1; //If above 7, shift argument left, else shift right
     tindex -= (tindex > 7) ? 7 : 0; //Index's above 7 share same elements with the index 7 behind it
-    dinf = MIN(1, inf);
+    dinf = _min(1, inf);
     hlength = (interval->b - interval->a) / 2;
     center = (interval->a + interval->b) / 2;
     if (tindex == 0) {
@@ -368,7 +371,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 
     /* Calculate resasc */
     mean_value = resultk / 2;
-    dbl_atomicAdd(&resultasc, wgk[tindex] * ABS(fval - mean_value));
+    dbl_atomicAdd(&resultasc, wgk[tindex] * _abs(fval - mean_value));
     __syncthreads();
 
     if (tindex == 0) {
@@ -381,9 +384,9 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
         interval->error = ABS((resultk - resultg) * hlength);
 
         if (interval->resasc != 0 && interval->error != 0) //traditonal way to calculate error
-            interval->error = interval->resasc * MIN(1, pow(200 * interval->error / interval->resasc, 1.5));
+            interval->error = interval->resasc * _min(1, pow(200 * interval->error / interval->resasc, 1.5));
         if (interval->resabs > DBL_MIN / (DBL_EPSILON * 50)) //Checks roundoff error
-            interval->error = MAX((DBL_EPSILON / 50) * interval->resabs, interval->error);
+            interval->error = _max((DBL_EPSILON / 50) * interval->resabs, interval->error);
     }
 }
 /*
@@ -400,7 +403,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 __device__ int findDivisions(double error, double errorsum, int index, int maxallowed) {
 
     int allowed = maxallowed - ((index + 1) * 2); //Amount of extra divisions to be distributed  
-    return (int) ((error / errorsum) * allowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
+    return (int)((error / errorsum) * allowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
 
 }
 
@@ -450,7 +453,7 @@ __device__ int checkRO(Subintegral* results, int num)
     return 1;
 }
 
-/* 
+/*
     Allocates space in a list.
 
     Parameters:
@@ -482,7 +485,7 @@ __device__ Subintegral* alloclist(Subintegral* list, int* index, int amount)
                      error in list
         nskimmed - number of skimmed results found
 */
-__global__ void flag(Subintegral* results, int index, double errorbound, int* nskimmed) 
+__global__ void flag(Subintegral* results, int index, double errorbound, int* nskimmed)
 {
     int tindex; //Unique thread identifier
 
@@ -493,7 +496,6 @@ __global__ void flag(Subintegral* results, int index, double errorbound, int* ns
         results[tindex].skimmed = 1;
         atomicAdd(nskimmed, 1);
     }
-    else results[tindex].skimmed = 0;
 }
 
 /*
@@ -511,7 +513,7 @@ __global__ void flag(Subintegral* results, int index, double errorbound, int* ns
         errorsum - total error over the entire list
         resultsum - total results over the entire list
 */
-        
+
 __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* nindex, double abserr_thresh, double relerr_thresh, double* resultsum)
 {
     int tindex; //Unique thread identifier
@@ -526,8 +528,8 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
     if (tindex <= oindex) {
         length = results[tindex].divisions;
         /* Start flagging results */
-        errorbound = MAX(abserr_thresh, relerr_thresh * ABS(*resultsum));
-        flag <<<length, 1>>> (results[tindex].results, length, errorbound, &results[tindex].nskimmed);
+        errorbound = _max(abserr_thresh, relerr_thresh * _abs(*resultsum));
+        flag <<<length, 1 >>> (results[tindex].results, length, errorbound, &results[tindex].nskimmed);
         nslist = results[tindex].results;
         slength = length - results[tindex].nskimmed;
         if (slength == 0) {
@@ -536,7 +538,7 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
             /* Place intervals that aren't skimmed into global */
             while (slength > 0) {
                 if (!nslist[length].skimmed) {
-                    slist[slength-1] = nslist[length-1];
+                    slist[slength - 1] = nslist[length - 1];
                     slength--;
                 }
                 length--;
@@ -558,7 +560,7 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
                       in the list
 */
 
-__global__ void setTotals(Subintegral* list, double* totalerror, double* totalresult) 
+__global__ void setTotals(Subintegral* list, double* totalerror, double* totalresult)
 {
     *totalerror = list[0].error;
     *totalresult = list[0].result;
@@ -571,7 +573,7 @@ __global__ void setTotals(Subintegral* list, double* totalerror, double* totalre
     Parameters:
         list - device sided list to hold subintegrals
 */
-__global__ void setInterval(Subintegral* list) 
+__global__ void setInterval(Subintegral* list)
 {
     list[0].a = 0;
     list[0].b = 1;
@@ -596,6 +598,21 @@ __device__ double dbl_atomicAdd(double* address, double val)
     return __longlong_as_double(old);
 }
 
+__host__ __device__ double _max(double a, double b)
+{
+    return ((a < b) ? b : a);
+}
+
+__host__ __device__ double _min(double a, double b) 
+{
+    return ((a < b) ? a : b);
+}
+
+__host__ __device__ double _abs(double a)
+{
+    return ((a < 0) ? -a : a);
+}
+
 /*
     Function turns on bits to flag errors over
     the integrand.
@@ -612,14 +629,14 @@ void flagError(Integrand* integrand, int error)
 /*
     Function used to finish up the program by setting the correct
     values to the integrand
-    
+
     Parameters:
         list - list of subintervals bisected
         integrand - structure representing the bundle of variables associated with
                     the integrand
         index - current index of the list
         inf - constant denoting which direction the integral
-              is infinite 
+              is infinite
 */
 void setvalues(Subintegral* list, Integrand* integrand, double errorsum, int index, int inf)
 {
@@ -646,12 +663,12 @@ int main()
     index = 0;
 
     /* Allocate device side memory */
-    Subintegral* d_list; cudaMalloc((void**) &d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED);
-    Result* d_results; cudaMalloc((void**) &d_results, sizeof(Result) * MAX_SUBINTERVALS_ALLOWED);
-    Integrand* d_integrand; cudaMalloc((void**) &d_integrand, sizeof(Integrand));
-    double* d_toterror;cudaMalloc((void**) &d_toterror, sizeof(double));
-    double* d_totresult; cudaMalloc((void**) &d_totresult, sizeof(double));
-    int* d_index; cudaMalloc((void**) &d_index, sizeof(double));
+    Subintegral* d_list; cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED);
+    Result* d_results; cudaMalloc((void**)&d_results, sizeof(Result) * MAX_SUBINTERVALS_ALLOWED);
+    Integrand* d_integrand; cudaMalloc((void**)&d_integrand, sizeof(Integrand));
+    double* d_toterror;cudaMalloc((void**)&d_toterror, sizeof(double));
+    double* d_totresult; cudaMalloc((void**)&d_totresult, sizeof(double));
+    int* d_index; cudaMalloc((void**)&d_index, sizeof(double));
     device.list = d_list;
     device.result = d_results;
     device.integrand = d_integrand;
@@ -660,11 +677,12 @@ int main()
     device.index = d_index;
     cudaMemcpy(device.integrand, &integrand, sizeof(Integrand), cudaMemcpyHostToDevice);
     /* Set first interval to (1,0) */
-    setInterval<<<1,1>>>(device.list);
+    setInterval << <1, 1 >> > (device.list);
     /* Parallel Gauss-Kronrod Quadrature */
-    fqk15i(device, 0, BOTH_INF, &resultsum, &errorsum);
-
-    wqk15i(device, &integrand, 0, BOTH_INF, &index, 0, 0, &errorsum, &resultsum);
+    fqk15i(device, 0, POSITIVE_INF, &resultsum, &errorsum);
+    double errorbound = MAX(0, 0 * ABS(resultsum));
+    if (errorsum > errorbound)
+        wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
     Subintegral list[MAX_SUBINTERVALS_ALLOWED];
     cudaMemcpy(list, device.list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED, cudaMemcpyDeviceToHost);
 
