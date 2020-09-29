@@ -6,7 +6,7 @@
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 50 //Number of cycles allowed before quit
 #define MAX_SUBINTERVALS_ALLOWED 10
-#define MAX_TOTALDIVISIONS_ALLOWED 10
+#define MAX_TOTALDIVISIONS_ALLOWED 2
 
 #define ABS(x) (((x) < 0) ? (-x) : (x))
 #define MAX(x, y) (((x) < (y)) ? (y) : (x))
@@ -66,7 +66,7 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  x;//1 / (1 + (x * x));
+    return  1 / (1 + (x * x));
 }
 
 void flagError(Integrand*, int);
@@ -142,12 +142,12 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
 
     /* Perform Dynamic Gauss-Kronrod Quadrature */
-    dqk15i << <oindex + 1, 1 >> > (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
+    dqk15i <<<oindex + 1, 1>>> (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
     /* Check round off error */
-    checkRoundOff << <oindex + 1, 1 >> > (device.integrand, device.result, oindex, device.index);
+    checkRoundOff <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
-    skimValues << <oindex + 1, 1 >> > (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
+    skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
 
     /* Copy results necissary to the CPU side */
     cudaMemcpy(index, device.index, sizeof(int), cudaMemcpyDeviceToHost);
@@ -204,7 +204,7 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
         divisions = findDivisions(list[tindex].error, *errorsum, oindex, MAX_TOTALDIVISIONS_ALLOWED);
         memindex = alloclist(allocmem, nindex, divisions);
         /* Perform Dynamic Gauss-Kronrod Quadrature*/
-        qk15i << <divisions, 1 >> > (original, memindex, bound, inf, divisions);
+        qk15i <<<divisions, 1>>> (original, memindex, bound, inf, divisions);
         cudaDeviceSynchronize();
 
         /* Improve previous approximations to integral and error and test for accuracy  */
@@ -296,7 +296,7 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
     list[tindex].a = delx * tindex;
     list[tindex].b = delx * (tindex + 1);
     /* Multiple Gauss-Kronrod Quadrature */
-    CUDA_qk15i << <1, 15 >> > (bound, inf, list + tindex);
+    CUDA_qk15i <<<1, 15>>> (bound, inf, list + tindex);
 }
 
 /*
@@ -389,6 +389,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
             interval->error = _max((DBL_EPSILON / 50) * interval->resabs, interval->error);
     }
 }
+
 /*
     Finds the appropriate amount of divisions to be allocated
     depending on percentage of error in interval.
@@ -530,9 +531,10 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
         /* Start flagging results */
         errorbound = _max(abserr_thresh, relerr_thresh * _abs(*resultsum));
         flag <<<length, 1 >>> (results[tindex].results, length, errorbound, &results[tindex].nskimmed);
+        cudaDeviceSynchronize();
         nslist = results[tindex].results;
         slength = length - results[tindex].nskimmed;
-        if (slength == 0) {
+        if (slength != 0) {
             /* Find Positions in Global Memory */
             slist = alloclist(list, nindex, slength);
             /* Place intervals that aren't skimmed into global */
@@ -681,8 +683,10 @@ int main()
     /* Parallel Gauss-Kronrod Quadrature */
     fqk15i(device, 0, POSITIVE_INF, &resultsum, &errorsum);
     double errorbound = MAX(0, 0 * ABS(resultsum));
-    if (errorsum > errorbound)
+    if (errorsum > errorbound){
         wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
+        //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
+    }
     Subintegral list[MAX_SUBINTERVALS_ALLOWED];
     cudaMemcpy(list, device.list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED, cudaMemcpyDeviceToHost);
 
