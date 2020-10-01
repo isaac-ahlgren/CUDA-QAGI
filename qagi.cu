@@ -5,8 +5,8 @@
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 50 //Number of cycles allowed before quit
-#define MAX_SUBINTERVALS_ALLOWED 10
-#define MAX_TOTALDIVISIONS_ALLOWED 2
+#define MAX_SUBINTERVALS_ALLOWED 30
+#define MAX_EXTRADIVISIONS_ALLOWED 10
 
 #define ABS(x) (((x) < 0) ? (-x) : (x))
 #define MAX(x, y) (((x) < (y)) ? (y) : (x))
@@ -66,7 +66,7 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  1 / (1 + (x * x));
+    return  1 / (1 + x * x);
 }
 
 void flagError(Integrand*, int);
@@ -132,6 +132,7 @@ void fqk15i(Device device, int bound, int inf, double* resultsum, double* errors
 __global__ void dqk15i(Subintegral*, Result*, int, int, int, int*, double*, double*);
 __global__ void checkRoundOff(Integrand*, Result*, int, int*);
 __global__ void skimValues(Subintegral*, Result*, int, int*, double, double, double*);
+__global__ void fixindex(int*);
 
 void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index, double abserr_thresh, double relerr_thresh, double* errorsum, double* resultsum)
 {
@@ -143,11 +144,13 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
 
     /* Perform Dynamic Gauss-Kronrod Quadrature */
     dqk15i <<<oindex + 1, 1>>> (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
+    fixindex <<<1,1>>> (device.index);
     /* Check round off error */
     checkRoundOff <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
     skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
+    fixindex <<<1,1>>> (device.index);
 
     /* Copy results necissary to the CPU side */
     cudaMemcpy(index, device.index, sizeof(int), cudaMemcpyDeviceToHost);
@@ -201,7 +204,7 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
     if (tindex <= oindex) {
         original = list[tindex];
         /* Find the amount of divisions and allocate amount of corresponding memory */
-        divisions = findDivisions(list[tindex].error, *errorsum, oindex, MAX_TOTALDIVISIONS_ALLOWED);
+        divisions = findDivisions(list[tindex].error, *errorsum, oindex, MAX_EXTRADIVISIONS_ALLOWED);
         memindex = alloclist(allocmem, nindex, divisions);
         /* Perform Dynamic Gauss-Kronrod Quadrature*/
         qk15i <<<divisions, 1>>> (original, memindex, bound, inf, divisions);
@@ -261,7 +264,7 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
                     atomicAdd(&(integrand->iroff2), 1);
                 else
                     atomicAdd(&(integrand->iroff1), 1);
-            if (*nindex > 10 && original.error < toterror)
+            if ((*nindex)-1 > 10 && original.error < toterror)
                 atomicAdd(&(integrand->iroff3), 1);
         }
     }
@@ -293,8 +296,8 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
     tindex = threadIdx.x + blockIdx.x * blockDim.x;
     delx = (initial.b - initial.a) / divisions;
     /* Creating interval to be disected */
-    list[tindex].a = delx * tindex;
-    list[tindex].b = delx * (tindex + 1);
+    list[tindex].a = delx * tindex + initial.a;
+    list[tindex].b = delx * (tindex + 1) + initial.a;
     /* Multiple Gauss-Kronrod Quadrature */
     CUDA_qk15i <<<1, 15>>> (bound, inf, list + tindex);
 }
@@ -311,7 +314,7 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
 */
 __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 {
-    double xk[] = { //arguments for Gauss-Kronod quadrature
+    double xk[] = { //arguments for Gauss-Kronrod quadrature
         0.0, 9.491079123427585E-01,
         8.648644233597691E-01, 7.415311855993944E-01,
         5.860872354676911E-01, 4.058451513773972E-01,
@@ -366,7 +369,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
     fval /= (sx * sx);
     dbl_atomicAdd(&resultg, wg[tindex] * fval);
     dbl_atomicAdd(&resultk, wgk[tindex] * fval);
-    dbl_atomicAdd(&resulta, wgk[tindex] * ABS(fval));
+    dbl_atomicAdd(&resulta, wgk[tindex] * _abs(fval));
     __syncthreads();
 
     /* Calculate resasc */
@@ -381,7 +384,7 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
         interval->skimmed = 0;
 
         /* Calculating error */
-        interval->error = ABS((resultk - resultg) * hlength);
+        interval->error = _abs((resultk - resultg) * hlength);
 
         if (interval->resasc != 0 && interval->error != 0) //traditonal way to calculate error
             interval->error = interval->resasc * _min(1, pow(200 * interval->error / interval->resasc, 1.5));
@@ -398,14 +401,16 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
         error - amount of error in interval
         errorsum - total error over entire list
         index - current index of list
-        maxallowed - maximum divisions allowed over
-                     entire list
+        extrallowed - extra divisions allowed after minimum of two are allowed
 */
-__device__ int findDivisions(double error, double errorsum, int index, int maxallowed) {
+__device__ int findDivisions(double error, double errorsum, int index, int extrallowed) {
+    int extraspace; //how much extra space is left
 
-    int allowed = maxallowed - ((index + 1) * 2); //Amount of extra divisions to be distributed  
-    return (int)((error / errorsum) * allowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
-
+    /*extraspace = MAX_SUBINTERVALS_ALLOWED - ((index+1) * 2 + extrallowed);
+    extrallowed = (extraspace >= 0) ? extrallowed : extrallowed + extraspace;
+    return (int)((error / errorsum) * extrallowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
+    */
+    return 2;
 }
 
 /*
@@ -582,6 +587,15 @@ __global__ void setInterval(Subintegral* list)
 }
 
 /*
+    Kernel used to fix nindex by subtracting one
+    
+    Parameters:
+        index - device sided index
+*/
+__global__ void fixindex(int* index) {
+        (*index)--;
+}
+/*
     Function used to preform addition atomically with
     double precision.
     Parameters:
@@ -684,7 +698,8 @@ int main()
     fqk15i(device, 0, POSITIVE_INF, &resultsum, &errorsum);
     double errorbound = MAX(0, 0 * ABS(resultsum));
     if (errorsum > errorbound){
-        wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
+        wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0.1, 0.1, &errorsum, &resultsum);;
+        //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
         //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
     }
     Subintegral list[MAX_SUBINTERVALS_ALLOWED];
@@ -693,7 +708,7 @@ int main()
     cudaError_t error = cudaGetLastError();
     printf("%s\n", cudaGetErrorString(error));
     printf("%d\n", index);
-    for (int i = 0; i < index; i++)
+    for (int i = 0; i <= index; i++)
         printf("%f %f\n", list[i].result, list[i].error);
     printf("\n");
     printf("%f %f\n", resultsum, errorsum);
