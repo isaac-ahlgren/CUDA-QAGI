@@ -8,13 +8,9 @@
 #define MAX_SUBINTERVALS_ALLOWED 30
 #define MAX_EXTRADIVISIONS_ALLOWED 10
 
-#define ABS(x) (((x) < 0) ? (-x) : (x))
-#define MAX(x, y) (((x) < (y)) ? (y) : (x))
-#define MIN(x, y) (((x) < (y)) ? (x) : (y))
-
 enum {
     NORMAL, MAX_ITERATIONS_ALLOWED = 0x1, ROUNDOFF_ERROR = 0x2, BAD_INTEGRAND_BEHAVIOR = 0x4,
-    TOLERANCE_CANNOT_BE_ACHIEVED = 0x8, DIVERGENT = 0x10, INVALID_INPUT = 0x20
+    TOLERANCE_CANNOT_BE_ACHIEVED = 0x8, DIVERGENT = 0x10, INVALID_INPUT = 0x20, NO_SPACE = 0x40
 };
 
 typedef struct sintegral {
@@ -37,23 +33,20 @@ typedef struct extr {
 } Epsilontable;
 
 typedef struct inte {
-    char equation[50]; //String for equation to be parsed
-    int evaluations; //number of evaluations of the integrand
-    double result; //total result calculated
-    double abserror; //total error in result calculated
-    int ier; //bit for error flagging
+    int currentevals; //Total number of evaluations over entire program
+    int ier; //bits for error flagging
     int iroff1, iroff2, iroff3; //flags for the amount of round off error detected through three different types
     int extrap; //logical variable denoting whether the algorithm is attempting extrapolation or not
     int noext; //logical variable denoting whether extrapolation is no longer allowed
 } Integrand;
 
 typedef struct res {
-    Subintegral original;
-    Subintegral* results;
-    double totalerror;
-    double totalresult;
-    int divisions;
-    int nskimmed;
+    Subintegral original; //Original result before quadrature
+    Subintegral* results; //List of intervals from the quadrature
+    double totalerror; //total error over list
+    double totalresult; //total result over list
+    int divisions; //total divisions allocated
+    int nskimmed; //number of results to be skimmed in list
 } Result;
 
 typedef struct dev {
@@ -70,10 +63,229 @@ __device__ double f(double x) {
 }
 
 void flagError(Integrand*, int);
-void setvalues(Subintegral*, Integrand*, double, int, int);
+void setvalues(Integrand*, double, double, int, double*, double*, int*, int*);
+void fqk15i(Device, int, int, double*, double*, double*, double*);
+void wqk15i(Device, Integrand*, int, int, int*, double, double, double*, double*);
+void extrapolate(Epsilontable*);
 __host__ __device__ double _max(double a, double b);
 __host__ __device__ double _min(double a, double b);
 __host__ __device__ double _abs(double a);
+
+void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh, double* result, double* abserror, int* evaluations, int* ier)
+{
+    Integrand integrand; //structure representing variables related to the integrand or its state
+    Device device; //structure representing reusable device side memory
+    double errorsum; //total error so far
+    double resultsum; //total results
+    double errorbound; //max error requested
+    double resasc; //approximation of F-I/(B-A) over transformed integrand
+    double resabs; //approximation of the integral over the absolute value of the function
+    int index; //index for the current subinterval in the sublist
+    int iterations; //Amount of times iterated through loop
+    int signchange; //logical variable indicating that there was a sign change over the interval
+
+    /* Initializing Variables */
+    *ier = NORMAL;
+    *evaluations = 0;
+    *result = 0;
+    *abserror = 0;
+    resultsum = 0;
+    errorsum = 0;
+    index = 0;
+    iterations = 1;
+    integrand.currentevals = (inf == BOTH_INF) ? 15 : 30;
+    integrand.ier = NORMAL;
+    integrand.iroff1 = 0;
+    integrand.iroff2 = 0;
+    integrand.iroff3 = 0;
+    integrand.noext = 0;
+    integrand.extrap = 0;
+    /* Allocate device side memory and storing struct for reusable memory */
+    Subintegral* d_list;    cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED); device.list = d_list;
+    Result* d_results;      cudaMalloc((void**)&d_results, sizeof(Result) * MAX_SUBINTERVALS_ALLOWED);   device.result = d_results;
+    Integrand* d_integrand; cudaMalloc((void**)&d_integrand, sizeof(Integrand));                         device.integrand = d_integrand;
+    double* d_toterror;     cudaMalloc((void**)&d_toterror, sizeof(double));                             device.totalerror = d_toterror;
+    double* d_totresult;    cudaMalloc((void**)&d_totresult, sizeof(double));                            device.totalresult = d_totresult;
+    int* d_index;           cudaMalloc((void**)&d_index, sizeof(double));                                device.index = d_index;
+    /* Copy integrand data to device side */
+    cudaMemcpy(device.integrand, &integrand, sizeof(Integrand), cudaMemcpyHostToDevice);
+
+    /* Test for valid input */
+    if (abserror_thresh < 0 && relerror_thresh < 0) {
+        flagError(&integrand, INVALID_INPUT);
+        return;
+    }
+    /* Autoset bound to 0 for unbounded intervals */
+    if (inf == BOTH_INF)
+        bound = 0;
+
+    /* Calculate first quadrature */
+    fqk15i(device, 0, inf, &resabs, &resasc, &resultsum, &errorsum);
+
+    /* Test of accuracy */
+    errorbound = _max(abserror_thresh, relerror_thresh * _abs(resultsum));
+
+    if (errorsum <= 100 * DBL_EPSILON * resabs && errorbound < errorsum) //checks if round off error and if the error is above threshhold
+                flagError(&integrand, ROUNDOFF_ERROR);
+        if (iterations == MAX_ITERATIONS - 1)
+                flagError(&integrand, MAX_ITERATIONS);
+        if (integrand.ier != NORMAL || (errorsum <= errorbound && errorsum != resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
+                *result = resultsum;
+                *evaluations = integrand.currentevals;
+                *abserror = errorsum;
+                return;
+        }
+        if ((1 - DBL_EPSILON / 2) * resabs <= _abs(resultsum))
+                signchange = 0;
+        else
+                signchange = 1;
+        
+    /* Start disecting interval */
+
+    /* Variables for extrapolation defined */
+    Epsilontable epsiltable; //epsilon table used for extrapolation
+    double epsilerror; //error calculated in epsilon table
+    double epsilresult; //results calculated in epsilon table
+    double ex_errorbound; //errorbound used in extrapolation
+    int ktmin; //amount of times extrapolated with no decrease in error
+    double correc; //the amount of error added in total error if roundoff detected in extrapolation
+
+    epsilresult = resultsum;
+    epsilerror = DBL_MAX;
+    epsiltable.list[0] = resultsum;
+    ktmin = 0;
+
+    for (iterations = 2; iterations < MAX_ITERATIONS; iterations++) {
+
+        /* Start Waterfall Quadrature */
+        wqk15i(device, &integrand, bound, inf, &index, abserror_thresh, relerror_thresh, &errorsum, &resultsum);
+
+        //Set error flags
+        if (10 <= integrand.iroff1 + integrand.iroff2 || 20 <= integrand.iroff3)
+            flagError(&integrand, ROUNDOFF_ERROR);
+        if (iterations >= MAX_ITERATIONS)
+            flagError(&integrand, MAX_ITERATIONS_ALLOWED);
+        if ((index+1) * 2 >= MAX_SUBINTERVALS_ALLOWED)
+            flagError(&integrand, NO_SPACE);
+        //if (_max(_abs(a1), _abs(b2)) <= (1 + 1000 * DBL_EPSILON) * (_abs(a2) + 1000 * DBL_MIN))
+            //flagError(integrand, BAD_INTEGRAND_BEHAVIOR);
+        
+        if (errorsum <= errorbound) { //If error is under requested threshhold, add up all results and end program
+            setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+            return;
+        }
+
+        if (integrand.ier != NORMAL) //If error detected, break out of loop and let error handling there
+            break;
+
+        if (iterations == 1) {//If first iteration, initialize extrapolation variables and start next iteration
+            epsiltable.list[1] = resultsum;
+            epsiltable.index = 1;
+            epsiltable.calls = 0;
+            ex_errorbound = errorbound;
+            continue;
+        }
+
+        if (integrand.noext) //start next iteration if extrapolation not allowed
+            continue;
+
+        /* Extrapolation */
+        int epsili = ++epsiltable.index;
+        epsiltable.list[epsili] = resultsum;
+        extrapolate(&epsiltable);
+        ktmin++;
+
+        if (5 < ktmin && epsilerror < 1.0E-03 * errorsum)
+                flagError(&integrand, TOLERANCE_CANNOT_BE_ACHIEVED);
+        if (epsiltable.error < epsilerror) { //Check if error found was less than previous error
+                ktmin = 0; //Reset ktmin
+                epsilerror = epsiltable.error;
+                epsilresult = epsiltable.result;
+                ex_errorbound = max(abserror_thresh, relerror_thresh * _abs(epsiltable.result));
+
+                if (*abserror <= ex_errorbound)
+                        break;
+        }
+
+        if (epsiltable.index == 0)
+            integrand.noext = 1;
+        if (integrand.ier == TOLERANCE_CANNOT_BE_ACHIEVED)
+            break;
+    }
+
+    /* Set final results and error */
+	if (epsilerror == DBL_MAX) { //if no extrapolation was necissary, set values
+		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		return;
+	}
+
+	if (integrand.ier == 0 && 5 > integrand.iroff2) { //if no problems arise in extrapolation, evaluate if divergent and set values
+
+		if (signchange && _max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02)
+            setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+		else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
+			flagError(&integrand, DIVERGENT);
+			setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+        }
+        else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+
+		return;
+	}
+
+	if (5 <= integrand.iroff2) //If round off error flaged in extrapolation table, modify error
+		epsilerror += correc;
+
+	if (integrand.ier == 0)
+		flagError(&integrand, ROUNDOFF_ERROR);
+
+	if (epsilresult != 0 && resultsum != 0) {
+
+		if (errorsum / _abs(resultsum) >= epsilerror / _abs(epsilresult)) {
+
+			if (signchange && max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02) 
+                setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+			else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
+				flagError(&integrand, DIVERGENT);
+			    setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+			}
+			return;
+		}
+        else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		
+		return;
+	}
+
+	if (errorsum < epsilerror) {
+		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		return;
+	}
+
+	if (resultsum == 0) {
+		setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+		return;
+	}
+
+	if (signchange && _max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02) { //Test if divergent
+        setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+        return;
+	}
+	else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
+		flagError(&integrand, DIVERGENT);
+		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		return;
+    }
+    else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+
+    return;
+}
+
+
+
+/**********************************************/
+/**********************************************/
+/************HOST FUNCTIONS********************/
+/**********************************************/
+/**********************************************/
 
 /*
     Evaluates initial interval using parallelized Gauss-Kronrod
@@ -86,23 +298,29 @@ __host__ __device__ double _abs(double a);
                 Default is 0.
         inf - constant used to denote which direction the
                 integral is infinite
+        resabs - integral of the absolute value of the function
+        resasc - integral of F-I/(B-A) over transformed integrand
         errorsum - total error over the entire list
         resultsum - total results over the entire list
 */
 
 __global__ void CUDA_qk15i(double, int, Subintegral*);
 __global__ void setTotals(Subintegral*, double*, double*);
+__global__ void setInterval(Subintegral*);
 
-void fqk15i(Device device, int bound, int inf, double* resultsum, double* errorsum)
+void fqk15i(Device device, int bound, int inf, double* resabs, double* resasc, double* resultsum, double* errorsum)
 {
+    /* Set first interval to (0,1) */
+    setInterval<<<1, 1>>>(device.list);
     /* Perform Initial Gauss-Kronrod Calculation */
-    CUDA_qk15i << <1, 15 >> > (bound, inf, device.list);
+    CUDA_qk15i <<<1, 15 >>> (bound, inf, device.list);
     /* Copy result and error to device side total error and results */
-    setTotals << <1, 1 >> > (device.list, device.totalerror, device.totalresult);
+    setTotals <<<1, 1 >>> (device.list, device.totalerror, device.totalresult);
     /* Copy result and error to host side total error and results */
     cudaMemcpy(resultsum, &device.list[0].result, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(errorsum, &device.list[0].error, sizeof(double), cudaMemcpyDeviceToHost);
-
+    cudaMemcpy(resasc, &device.list[0].resasc, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(resabs, &device.list[0].resabs, sizeof(double), cudaMemcpyDeviceToHost);
 }
 
 /*
@@ -133,18 +351,24 @@ __global__ void dqk15i(Subintegral*, Result*, int, int, int, int*, double*, doub
 __global__ void checkRoundOff(Integrand*, Result*, int, int*);
 __global__ void skimValues(Subintegral*, Result*, int, int*, double, double, double*);
 __global__ void fixindex(int*);
+void updateEvaluations(int*, int*, int);
 
 void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index, double abserr_thresh, double relerr_thresh, double* errorsum, double* resultsum)
 {
+    int currentevals; //Current evaluations
     int oindex; //Original index before quadrature
 
-    /* Reset necissary arguments */
     oindex = *index;
-    cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
+    currentevals = integrand->currentevals;
+    cudaMemcpy(device.integrand, integrand, sizeof(Integrand), cudaMemcpyHostToDevice);
 
     /* Perform Dynamic Gauss-Kronrod Quadrature */
+    cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
     dqk15i <<<oindex + 1, 1>>> (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
     fixindex <<<1,1>>> (device.index);
+
+    updateEvaluations(device.index, &currentevals, inf);
+
     /* Check round off error */
     checkRoundOff <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
     /* Skim results */
@@ -157,7 +381,190 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemcpy(integrand, device.integrand, sizeof(Integrand), cudaMemcpyDeviceToHost);
     cudaMemcpy(resultsum, device.totalresult, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(errorsum, device.totalerror, sizeof(double), cudaMemcpyDeviceToHost);
+    /* Set total evaluations */
+    integrand->currentevals = currentevals;
 }
+
+/*
+    Extrapolates series convergence of result
+    of integrand using epsilon algorithm.
+
+    Parameters:
+        table - the epsilon table for Wynn's
+                epsilon algorithm
+*/
+void extrapolate(Epsilontable* table)
+{
+	double error; //Absolute error calulated by the table
+	double result; //Result calculated by the table
+	int n; //Amount of elements in the Epsilontable
+	int k; //Index of the Epsilontable 
+	int num; //Number of elements originally in the Epsilon table
+	int extraplim; //Maximum number of elements allowed in the table
+	int newelements; //Number of new elements added to the table
+	double e0, e1, e2, e3; //Elements of the Lozenge used to arrange the Hankel matrix
+	double error1, error2, error3; //Absolute value of the difference between e3 and e1 ,e2 and e1, e1 and e0 respectively
+	double tol1, tol2, tol3; //Tolerance allowed in the calculations determining convergence
+	double ss;
+	double epsinf;
+
+	table->calls++;
+	table->error = DBL_MAX;
+	n = table->index;
+	table->result = table->list[n];
+
+	if (n < 2) { //Not enough elements to make an extrapolation
+		table->error = max(table->error, (DBL_EPSILON / 2) * _abs(table->result)); //Not enough elements to make an extrapolation
+		return;
+	}
+
+	extraplim = 50;
+	table->list[n + 2] = table->list[n];
+	table->list[n] = DBL_MAX;
+	newelements = n / 2;
+	k = num = n;
+
+	for (int i = 0; i < newelements; i++) {
+		e0 = table->list[k - 2];
+		e1 = table->list[k - 1];
+		e2 = table->list[k + 2];
+		error2 = _abs(e2 - e1);
+		error3 = _abs(e1 - e0);
+		tol2 = DBL_EPSILON * max(_abs(e1), _abs(e2));
+		tol3 = DBL_EPSILON * max(_abs(e1), _abs(e0));
+
+		/* If e0, e1, and e2 are equal to within machine accuracy, convergence is assumed */
+		if (error2 <= tol2 && error3 <= tol3) {
+			table->result = e2;
+			table->error = max(error2 + error3, DBL_EPSILON / 2 * _abs(table->result));
+			return;
+		}
+
+		e3 = table->list[k];
+		table->list[k] = e1;
+		error1 = _abs(e1 - e3);
+		tol1 = DBL_EPSILON * max(_abs(e1), _abs(e3));
+
+		/* If two elements are very close to eachother, omit a portion of the table */
+		if (error1 <= tol1 || error2 <= tol2 || error3 <= tol3) {
+			n = i + i;
+			break;
+		}
+
+		ss = 1 / (e1 - e3) + 1 / (e2 - e1) - 1 / (e1 - e0);
+		epsinf = _abs(ss * e1);
+
+		/* Testing for irregular behavior */
+		if (epsinf <= 1.0E-04) {
+			n = i + i;
+			break;
+		}
+		
+		/* Compute new element */
+		result = e1 + 1 / ss;
+		table->list[k] = result;
+		k -= 2;
+		error = error2 + _abs(result - e2) + error3;
+
+		if (error <= table->error) {
+			table->error = error;
+			table->result = result;
+		}
+	}
+
+	/* Shift table */
+	n = (n == (extraplim - 1)) ? 2 * ((extraplim-1) / 2) - 1 : n;
+	int ib = ((num+1) % 2 == 0) ? 1 : 0;
+	int ie = newelements + 1;
+
+	for (int i = 0; i < ie; i++) {
+		table->list[ib] = table->list[ib + 2];
+		ib += 2;
+	}
+
+	if (num != n) { //If portion of table was detected to be irregular, shift over table to get rid of irregular portion
+		int index = num - n;
+		for (int i = 0; i < n; i++) {
+			table->list[i] = table->list[index];
+			index++;
+		}
+	}
+
+	if (table->calls < 4) { //Not enough extrapolated values to make an error estimate
+		int calls = table->calls-1;
+		table->prevlist[calls] = table->result;
+		table->error = DBL_MAX;
+	}
+	else { //If enough extrapolated values, estimate the error with the 3 previous results
+		table->error = _abs(table->result - table->prevlist[2]) + _abs(table->result - table->prevlist[1]) + 
+			_abs(table->result - table->prevlist[0]);
+		table->prevlist[0] = table->prevlist[1];
+		table->prevlist[1] = table->prevlist[2];
+		table->prevlist[2] = result;
+	}
+	table->error = max(table->error, (DBL_EPSILON / 2) * _abs(table->result));
+	table->index = n;
+
+}
+
+/*
+    Function turns on bits to flag errors over
+    the integrand.
+    Parameters:
+        integrand - the structure repesenting the integrand
+        error - desired error to be flagged
+*/
+void flagError(Integrand* integrand, int error)
+{
+    integrand->ier |= error;
+}
+
+/*
+    Function used to update number of evaluations
+
+    Parameters:
+        d_index - device side index pointer
+        currentevals - the current evaluations
+        inf - constant used to denote which direction the
+              integral is infinite
+*/
+void updateEvaluations(int* d_index, int* currentevals, int inf)
+{
+    int* index; //Index found
+
+    cudaMemcpy(index, d_index, sizeof(int), cudaMemcpyDeviceToHost);
+    *currentevals += (inf == BOTH_INF) ? 2 * ((*index+1) * 15) : (*index+1) * 15;
+}
+
+/*
+    Function used to finish up the program by setting the correct
+    values to the integrand
+
+    Parameters:
+        list - list of subintervals bisected
+        integrand - structure representing the bundle of variables associated with
+                    the integrand
+        resultsum - total results
+        errorsum - total error
+        totali - total intervals over entire program
+        inf - constant denoting which direction the integral
+              is infinite
+*/
+void setvalues(Integrand* integrand, double resultsum, double errorsum, int inf, double* result, double* abserror, int* evaluations, int* ier)
+{
+    *result = resultsum;
+    *evaluations = integrand->currentevals;
+    *abserror = errorsum;
+    *ier = integrand->ier;
+}
+
+
+
+/**********************************************/
+/**********************************************/
+/************GLOBAL FUNCTIONS******************/
+/**********************************************/
+/**********************************************/
 
 /*
     Uses multiple threads to launch Gauss-Kronrod Quadrature over
@@ -258,13 +665,13 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
         original = rlist[tindex].original;
         /* Checking roundoff error */
         if (checkRO(list, divisions)) {
-            if (ABS(original.result - totresult) <= 1.0E-05 * ABS(totresult)
+            if (_abs(original.result - totresult) <= 1.0E-05 * _abs(totresult)
                 && 9.9E-01 * original.error <= toterror)
                 if (integrand->extrap)
                     atomicAdd(&(integrand->iroff2), 1);
                 else
                     atomicAdd(&(integrand->iroff1), 1);
-            if ((*nindex)-1 > 10 && original.error < toterror)
+            if (*nindex > 10 && original.error < toterror)
                 atomicAdd(&(integrand->iroff3), 1);
         }
     }
@@ -394,93 +801,6 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 }
 
 /*
-    Finds the appropriate amount of divisions to be allocated
-    depending on percentage of error in interval.
-
-    Parameters:
-        error - amount of error in interval
-        errorsum - total error over entire list
-        index - current index of list
-        extrallowed - extra divisions allowed after minimum of two are allowed
-*/
-__device__ int findDivisions(double error, double errorsum, int index, int extrallowed) {
-    int extraspace; //how much extra space is left
-
-    /*extraspace = MAX_SUBINTERVALS_ALLOWED - ((index+1) * 2 + extrallowed);
-    extrallowed = (extraspace >= 0) ? extrallowed : extrallowed + extraspace;
-    return (int)((error / errorsum) * extrallowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
-    */
-    return 2;
-}
-
-/*
-    Sums all results calulated.
-
-    Parameters:
-        results - list of calculated intervals
-        num - amount of intervals
-*/
-__device__ double sumResults(Subintegral* results, int num)
-{
-    double res = 0;
-    for (int i = 0; i < num; i++)
-        res += results[i].result;
-    return res;
-}
-
-/*
-    Sums all error found.
-
-    Parameters:
-        results - list of calculated intervals
-        num - amount of intervals
-*/
-__device__ double sumError(Subintegral* results, int num)
-{
-    double err = 0;
-    for (int i = 0; i < num; i++)
-        err += results[i].error;
-    return err;
-}
-
-/*
-    Checks if every member in list satisfies this
-    condition: resasc == error
-
-    Parameters:
-        results - list of calculated intervals
-        num - amount of intervals
-*/
-__device__ int checkRO(Subintegral* results, int num)
-{
-    for (int i = 0; i < num; i++)
-        if (results[i].resasc == results[i].error)
-            return 0;
-    return 1;
-}
-
-/*
-    Allocates space in a list.
-
-    Parameters:
-        list - list to be allocated
-        index - current index of list
-        amount - amount of space needed
-*/
-__device__ Subintegral* alloclist(Subintegral* list, int* index, int amount)
-{
-    int old; //Older copy of variable
-    int mindex;
-
-    old = *index;
-    do {
-        mindex = old;
-        old = atomicCAS(index, mindex, mindex + amount);
-    } while (mindex != old);
-    return mindex + list;
-}
-
-/*
     Flags list of results to be "skimmed" or also known as
     taking an interval out of circulation.
 
@@ -595,6 +915,102 @@ __global__ void setInterval(Subintegral* list)
 __global__ void fixindex(int* index) {
         (*index)--;
 }
+
+
+
+/**********************************************/
+/**********************************************/
+/************DEVICE FUNCTIONS******************/
+/**********************************************/
+/**********************************************/
+
+/*
+    Finds the appropriate amount of divisions to be allocated
+    depending on percentage of error in interval.
+
+    Parameters:
+        error - amount of error in interval
+        errorsum - total error over entire list
+        index - current index of list
+        extrallowed - extra divisions allowed after minimum of two are allowed
+*/
+__device__ int findDivisions(double error, double errorsum, int index, int extrallowed) {
+    int extraspace; //how much extra space is left
+
+    /*extraspace = MAX_SUBINTERVALS_ALLOWED - ((index+1) * 2 + extrallowed);
+    extrallowed = (extraspace >= 0) ? extrallowed : extrallowed + extraspace;
+    return (int)((error / errorsum) * extrallowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
+    */
+    return 2;
+}
+
+/*
+    Sums all results calulated.
+
+    Parameters:
+        results - list of calculated intervals
+        num - amount of intervals
+*/
+__device__ double sumResults(Subintegral* results, int num)
+{
+    double res = 0;
+    for (int i = 0; i < num; i++)
+        res += results[i].result;
+    return res;
+}
+
+/*
+    Sums all error found.
+
+    Parameters:
+        results - list of calculated intervals
+        num - amount of intervals
+*/
+__device__ double sumError(Subintegral* results, int num)
+{
+    double err = 0;
+    for (int i = 0; i < num; i++)
+        err += results[i].error;
+    return err;
+}
+
+/*
+    Checks if every member in list satisfies this
+    condition: resasc == error
+
+    Parameters:
+        results - list of calculated intervals
+        num - amount of intervals
+*/
+__device__ int checkRO(Subintegral* results, int num)
+{
+    for (int i = 0; i < num; i++)
+        if (results[i].resasc == results[i].error)
+            return 0;
+    return 1;
+}
+
+/*
+    Allocates space in a list.
+
+    Parameters:
+        list - list to be allocated
+        index - current index of list
+        amount - amount of space needed
+*/
+__device__ Subintegral* alloclist(Subintegral* list, int* index, int amount)
+{
+    int old; //Older copy of variable
+    int mindex;
+
+    old = *index;
+    do {
+        mindex = old;
+        old = atomicCAS(index, mindex, mindex + amount);
+    } while (mindex != old);
+    return mindex + list;
+}
+
 /*
     Function used to preform addition atomically with
     double precision.
@@ -629,87 +1045,15 @@ __host__ __device__ double _abs(double a)
     return ((a < 0) ? -a : a);
 }
 
-/*
-    Function turns on bits to flag errors over
-    the integrand.
-    Parameters:
-        integrand - the structure repesenting the integrand
-        error - desired error to be flagged
-*/
-void flagError(Integrand* integrand, int error)
-{
-    integrand->ier |= error;
-}
-
-
-/*
-    Function used to finish up the program by setting the correct
-    values to the integrand
-
-    Parameters:
-        list - list of subintervals bisected
-        integrand - structure representing the bundle of variables associated with
-                    the integrand
-        index - current index of the list
-        inf - constant denoting which direction the integral
-              is infinite
-*/
-void setvalues(Subintegral* list, Integrand* integrand, double errorsum, int index, int inf)
-{
-    double res = 0;
-    for (int i = 0; i <= index; i++)
-        res += list[i].result;
-    integrand->result = res;
-    integrand->evaluations = (inf == BOTH_INF) ? 2 * (15 + index * 30) : 15 + index * 30;
-    integrand->abserror = errorsum;
-}
-
 int main()
 {
-    Integrand integrand;
-    Device device;
-    int index;
-    double errorsum;
-    double resultsum;
+    double result;
+    double abserror;
+    int evaluations;
+    int ier;
 
-    integrand.ier = 0;
-    integrand.evaluations = 0;
-    integrand.result = 0;
-    integrand.abserror = 0;
-    index = 0;
+    qagi(0, BOTH_INF, 0.1, 0.1, &result, &abserror, &evaluations, &ier);
 
-    /* Allocate device side memory */
-    Subintegral* d_list; cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED);
-    Result* d_results; cudaMalloc((void**)&d_results, sizeof(Result) * MAX_SUBINTERVALS_ALLOWED);
-    Integrand* d_integrand; cudaMalloc((void**)&d_integrand, sizeof(Integrand));
-    double* d_toterror;cudaMalloc((void**)&d_toterror, sizeof(double));
-    double* d_totresult; cudaMalloc((void**)&d_totresult, sizeof(double));
-    int* d_index; cudaMalloc((void**)&d_index, sizeof(double));
-    device.list = d_list;
-    device.result = d_results;
-    device.integrand = d_integrand;
-    device.totalerror = d_toterror;
-    device.totalresult = d_totresult;
-    device.index = d_index;
-    cudaMemcpy(device.integrand, &integrand, sizeof(Integrand), cudaMemcpyHostToDevice);
-    /* Set first interval to (1,0) */
-    setInterval << <1, 1 >> > (device.list);
-    /* Parallel Gauss-Kronrod Quadrature */
-    fqk15i(device, 0, POSITIVE_INF, &resultsum, &errorsum);
-    double errorbound = MAX(0, 0 * ABS(resultsum));
-    if (errorsum > errorbound){
-        wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0.1, 0.1, &errorsum, &resultsum);;
-        //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
-        //wqk15i(device, &integrand, 0, POSITIVE_INF, &index, 0, 0, &errorsum, &resultsum);
-    }
-    Subintegral list[MAX_SUBINTERVALS_ALLOWED];
-    cudaMemcpy(list, device.list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED, cudaMemcpyDeviceToHost);
+    printf("Results: %f\nError: %f\nEvaluations: %d\n", result, abserror, evaluations);
 
-    cudaError_t error = cudaGetLastError();
-    printf("%s\n", cudaGetErrorString(error));
-    printf("%d\n", index);
-    for (int i = 0; i <= index; i++)
-        printf("%f %f\n", list[i].result, list[i].error);
-    printf("\n");
-    printf("%f %f\n", resultsum, errorsum);
 }
