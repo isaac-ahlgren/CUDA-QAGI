@@ -5,7 +5,7 @@
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 50 //Number of cycles allowed before quit
-#define MAX_SUBINTERVALS_ALLOWED 30
+#define MAX_SUBINTERVALS_ALLOWED 1000
 #define MAX_EXTRADIVISIONS_ALLOWED 10
 
 enum {
@@ -59,14 +59,14 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  1 / (1 + x * x);
+    return  pow(sin(x)/x,2);//1 / (1 + x * x);
 }
 
-void flagError(Integrand*, int);
 void setvalues(Integrand*, double, double, int, double*, double*, int*, int*);
 void fqk15i(Device, int, int, double*, double*, double*, double*);
 void wqk15i(Device, Integrand*, int, int, int*, double, double, double*, double*);
 void extrapolate(Epsilontable*);
+__host__ __device__ void flagError(Integrand*, int);
 __host__ __device__ double _max(double a, double b);
 __host__ __device__ double _min(double a, double b);
 __host__ __device__ double _abs(double a);
@@ -93,7 +93,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     errorsum = 0;
     index = 0;
     iterations = 1;
-    integrand.currentevals = (inf == BOTH_INF) ? 15 : 30;
+    integrand.currentevals = (inf == BOTH_INF) ? 30 : 15;
     integrand.ier = NORMAL;
     integrand.iroff1 = 0;
     integrand.iroff2 = 0;
@@ -167,8 +167,6 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             flagError(&integrand, MAX_ITERATIONS_ALLOWED);
         if ((index+1) * 2 >= MAX_SUBINTERVALS_ALLOWED)
             flagError(&integrand, NO_SPACE);
-        //if (_max(_abs(a1), _abs(b2)) <= (1 + 1000 * DBL_EPSILON) * (_abs(a2) + 1000 * DBL_MIN))
-            //flagError(integrand, BAD_INTEGRAND_BEHAVIOR);
         
         if (errorsum <= errorbound) { //If error is under requested threshhold, add up all results and end program
             setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
@@ -178,7 +176,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
         if (integrand.ier != NORMAL) //If error detected, break out of loop and let error handling there
             break;
 
-        if (iterations == 1) {//If first iteration, initialize extrapolation variables and start next iteration
+        if (iterations == 2) {//If first iteration, initialize extrapolation variables and start next iteration
             epsiltable.list[1] = resultsum;
             epsiltable.index = 1;
             epsiltable.calls = 0;
@@ -203,7 +201,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
                 epsilresult = epsiltable.result;
                 ex_errorbound = max(abserror_thresh, relerror_thresh * _abs(epsiltable.result));
 
-                if (*abserror <= ex_errorbound)
+                if (epsilerror <= ex_errorbound)
                         break;
         }
 
@@ -348,7 +346,7 @@ void fqk15i(Device device, int bound, int inf, double* resabs, double* resasc, d
 */
 
 __global__ void dqk15i(Subintegral*, Result*, int, int, int, int*, double*, double*);
-__global__ void checkRoundOff(Integrand*, Result*, int, int*);
+__global__ void checkError(Integrand*, Result*, int, int*);
 __global__ void skimValues(Subintegral*, Result*, int, int*, double, double, double*);
 __global__ void fixindex(int*);
 void updateEvaluations(int*, int*, int);
@@ -370,7 +368,7 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     updateEvaluations(device.index, &currentevals, inf);
 
     /* Check round off error */
-    checkRoundOff <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
+    checkError <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
     skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
@@ -414,7 +412,7 @@ void extrapolate(Epsilontable* table)
 	table->result = table->list[n];
 
 	if (n < 2) { //Not enough elements to make an extrapolation
-		table->error = max(table->error, (DBL_EPSILON / 2) * _abs(table->result)); //Not enough elements to make an extrapolation
+		table->error = _max(table->error, (DBL_EPSILON / 2) * _abs(table->result)); //Not enough elements to make an extrapolation
 		return;
 	}
 
@@ -430,8 +428,8 @@ void extrapolate(Epsilontable* table)
 		e2 = table->list[k + 2];
 		error2 = _abs(e2 - e1);
 		error3 = _abs(e1 - e0);
-		tol2 = DBL_EPSILON * max(_abs(e1), _abs(e2));
-		tol3 = DBL_EPSILON * max(_abs(e1), _abs(e0));
+		tol2 = DBL_EPSILON * _max(_abs(e1), _abs(e2));
+		tol3 = DBL_EPSILON * _max(_abs(e1), _abs(e0));
 
 		/* If e0, e1, and e2 are equal to within machine accuracy, convergence is assumed */
 		if (error2 <= tol2 && error3 <= tol3) {
@@ -508,18 +506,6 @@ void extrapolate(Epsilontable* table)
 }
 
 /*
-    Function turns on bits to flag errors over
-    the integrand.
-    Parameters:
-        integrand - the structure repesenting the integrand
-        error - desired error to be flagged
-*/
-void flagError(Integrand* integrand, int error)
-{
-    integrand->ier |= error;
-}
-
-/*
     Function used to update number of evaluations
 
     Parameters:
@@ -530,10 +516,10 @@ void flagError(Integrand* integrand, int error)
 */
 void updateEvaluations(int* d_index, int* currentevals, int inf)
 {
-    int* index; //Index found
-
-    cudaMemcpy(index, d_index, sizeof(int), cudaMemcpyDeviceToHost);
-    *currentevals += (inf == BOTH_INF) ? 2 * ((*index+1) * 15) : (*index+1) * 15;
+    int index; //Index found
+    
+    cudaMemcpy(&index, d_index, sizeof(int), cudaMemcpyDeviceToHost);
+    *currentevals += (inf == BOTH_INF) ? 2 * ((index+1) * 15) : (index+1) * 15;
 }
 
 /*
@@ -558,6 +544,48 @@ void setvalues(Integrand* integrand, double resultsum, double errorsum, int inf,
     *ier = integrand->ier;
 }
 
+/*
+    Used to print the meaning of the bit flags in ier.
+
+    Parameters:
+        ier - bit flags for integral
+*/
+void printError(int ier)
+{
+    int mask = 1;
+    int errors = 0;
+    if (ier == 0)
+        printf("NORMAL\n");
+    else {
+        for (int i = 0; i < 7; i++) {
+            switch (ier & mask) {
+                case MAX_ITERATIONS_ALLOWED:
+                    printf("MAX ITERATIONS HAVE BEEN REACHED\n");
+                    break;
+                case ROUNDOFF_ERROR:
+                    printf("ROUND OFF ERROR DETECTED\n");
+                    break;
+                case BAD_INTEGRAND_BEHAVIOR:
+                    printf("BAD INTEGRAND ERROR DETECTED\n");
+                    break;
+                case TOLERANCE_CANNOT_BE_ACHIEVED:
+                    printf("TOLERANCE CANNOT BE ACHIEVED\n");
+                    break;
+                case DIVERGENT:
+                    printf("INTEGRAND IS DIVERGENT\n");
+                    break;
+                case INVALID_INPUT:
+                    printf("INVALID INPUT\n");
+                    break;
+                case NO_SPACE:
+                    printf("NO SPACE FOR NEXT QUADRATURE\n");
+                    break;
+            }
+            mask = mask << 1;
+        }
+    }
+}
+
 
 
 /**********************************************/
@@ -570,7 +598,7 @@ void setvalues(Integrand* integrand, double resultsum, double errorsum, int inf,
     Uses multiple threads to launch Gauss-Kronrod Quadrature over
     every interval. Each interval gets a dynamically allocated
     amount of divisions with each one getting at least 2. These
-    results are then appended to rlist and used checkRoundOff and
+    results are then appended to rlist and used checkError and
     skimValues.
 
     Parameters:
@@ -592,7 +620,7 @@ __device__ int findDivisions(double, double, int, int);
 __device__ double sumResults(Subintegral*, int);
 __device__ double sumError(Subintegral*, int);
 __device__ Subintegral* alloclist(Subintegral*, int*, int);
-__device__ double dbl_atomicAdd(double*, double);
+__device__ double atomicAddDbl(double*, double);
 
 /* Memory to be dynamically allocated */
 __device__ Subintegral allocmem[MAX_SUBINTERVALS_ALLOWED];
@@ -620,8 +648,8 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
         /* Improve previous approximations to integral and error and test for accuracy  */
         totresult = sumResults(memindex, divisions);
         toterror = sumError(memindex, divisions);
-        dbl_atomicAdd(errorsum, toterror - original.error);
-        dbl_atomicAdd(resultsum, totresult - original.result);
+     atomicAddDbl(errorsum, toterror - original.error);
+     atomicAddDbl(resultsum, totresult - original.result);
         /* Append results to interfunctional list */
         rlist[tindex].original = original;
         rlist[tindex].results = memindex;
@@ -644,9 +672,10 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
         oindex - original index of list
         nindex - new index of list
 */
-__device__ int checkRO(Subintegral*, int);
+__device__ int checkRoundOff(Subintegral*, int);
+__device__ int checkBehavior(Subintegral*, int);
 
-__global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, int* nindex)
+__global__ void checkError(Integrand* integrand, Result* rlist, int oindex, int* nindex)
 {
     int tindex; //Unique Thread index
     int divisions; //Amount of divisions allocated to subinterval
@@ -664,7 +693,7 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
         list = rlist[tindex].results;
         original = rlist[tindex].original;
         /* Checking roundoff error */
-        if (checkRO(list, divisions)) {
+        if (checkRoundOff(list, divisions)) {
             if (_abs(original.result - totresult) <= 1.0E-05 * _abs(totresult)
                 && 9.9E-01 * original.error <= toterror)
                 if (integrand->extrap)
@@ -674,6 +703,9 @@ __global__ void checkRoundOff(Integrand* integrand, Result* rlist, int oindex, i
             if (*nindex > 10 && original.error < toterror)
                 atomicAdd(&(integrand->iroff3), 1);
         }
+        if (checkBehavior(list, divisions))
+            flagError(integrand, BAD_INTEGRAND_BEHAVIOR);
+
     }
 }
 
@@ -719,6 +751,9 @@ __global__ void qk15i(Subintegral initial, Subintegral* list, int bound, int inf
                 integral is infinite
         interval - interval to be evaluated
 */
+
+__device__ double atomicAddFma(double*, double, double);
+
 __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
 {
     double xk[] = { //arguments for Gauss-Kronrod quadrature
@@ -774,14 +809,14 @@ __global__ void CUDA_qk15i(double bound, int inf, Subintegral* interval)
     if (inf == BOTH_INF)
         fval += f(-transx);
     fval /= (sx * sx);
-    dbl_atomicAdd(&resultg, wg[tindex] * fval);
-    dbl_atomicAdd(&resultk, wgk[tindex] * fval);
-    dbl_atomicAdd(&resulta, wgk[tindex] * _abs(fval));
+    atomicAddFma(&resultg, fval, wg[tindex]);
+    atomicAddFma(&resultk, fval, wgk[tindex]);
+    atomicAddFma(&resulta, _abs(fval), wgk[tindex]);
     __syncthreads();
 
     /* Calculate resasc */
     mean_value = resultk / 2;
-    dbl_atomicAdd(&resultasc, wgk[tindex] * _abs(fval - mean_value));
+    atomicAddFma(&resultasc, _abs(fval - mean_value), wgk[tindex]);
     __syncthreads();
 
     if (tindex == 0) {
@@ -982,12 +1017,28 @@ __device__ double sumError(Subintegral* results, int num)
         results - list of calculated intervals
         num - amount of intervals
 */
-__device__ int checkRO(Subintegral* results, int num)
+__device__ int checkRoundOff(Subintegral* results, int num)
 {
     for (int i = 0; i < num; i++)
         if (results[i].resasc == results[i].error)
             return 0;
     return 1;
+}
+
+__device__ int checkBehavior(Subintegral* results, int num)
+{
+    double a; //Left bound being evaluated
+    double b; //Right bound being evaluated
+    double m; //Mid point being evaluated
+
+    for (int i = 0; i < num-1; i++) {
+        a = results[i].a;
+        m = results[i].b;
+        b = results[i+1].b;
+        if (_max(_abs(a), _abs(b)) <= (1 + 1000 * DBL_EPSILON) * (_abs(m) + 1000 * DBL_MIN))
+            return 1;
+    }
+    return 0;
 }
 
 /*
@@ -1018,7 +1069,7 @@ __device__ Subintegral* alloclist(Subintegral* list, int* index, int amount)
         address - pointer to memory address of double to be incremented
         val - the value to increment with
 */
-__device__ double dbl_atomicAdd(double* address, double val)
+__device__ double atomicAddDbl(double* address, double val)
 {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
     unsigned long long int old = *address_as_ull, assumed;
@@ -1028,6 +1079,30 @@ __device__ double dbl_atomicAdd(double* address, double val)
             __double_as_longlong(val + __longlong_as_double(assumed)));
     } while (assumed != old);
     return __longlong_as_double(old);
+}
+
+__device__ double atomicAddFma(double* address, double a, double b)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+            __double_as_longlong(fma(a, b, __longlong_as_double(assumed))));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+/*
+    Function turns on bits to flag errors over
+    the integrand.
+    Parameters:
+        integrand - the structure repesenting the integrand
+        error - desired error to be flagged
+*/
+__host__ __device__ void flagError(Integrand* integrand, int error)
+{
+    integrand->ier |= error;
 }
 
 __host__ __device__ double _max(double a, double b)
@@ -1045,6 +1120,12 @@ __host__ __device__ double _abs(double a)
     return ((a < 0) ? -a : a);
 }
 
+__global__ void test(double* var)
+{
+    for (double i = 0; i < 3; i++)
+        atomicAddFma(var, i, 1);
+}
+
 int main()
 {
     double result;
@@ -1052,8 +1133,17 @@ int main()
     int evaluations;
     int ier;
 
-    qagi(0, BOTH_INF, 0.1, 0.1, &result, &abserror, &evaluations, &ier);
+    qagi(0, BOTH_INF, 0, 0, &result, &abserror, &evaluations, &ier);
 
     printf("Results: %f\nError: %f\nEvaluations: %d\n", result, abserror, evaluations);
-
+    printError(ier);
+    
+    /*
+    double var = 0;
+    double* d_var; cudaMalloc((void**)&d_var, sizeof(double));
+    cudaMemcpy(d_var, &var, sizeof(double), cudaMemcpyHostToDevice);
+    test <<<1,1>>> (d_var);
+    cudaMemcpy(&var, d_var, sizeof(double), cudaMemcpyDeviceToHost);
+    printf("%f\n", var);
+    */
 }
