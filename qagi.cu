@@ -4,8 +4,8 @@
 #define NEGATIVE_INF -1 //(-inf, b)
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
-#define MAX_ITERATIONS 400 //Number of cycles allowed before quit
-#define MAX_SUBINTERVALS_ALLOWED 1000
+#define MAX_ITERATIONS 1000 //Number of cycles allowed before quit
+#define MAX_SUBINTERVALS_ALLOWED 5000
 #define MAX_EXTRADIVISIONS_ALLOWED 10
 
 enum {
@@ -70,6 +70,7 @@ __host__ __device__ void flagError(Integrand*, int);
 __host__ __device__ double _max(double a, double b);
 __host__ __device__ double _min(double a, double b);
 __host__ __device__ double _abs(double a);
+__global__ void printlist(Device);
 
 void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh, double* result, double* abserror, int* evaluations, int* ier)
 {
@@ -98,7 +99,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     integrand.iroff1 = 0;
     integrand.iroff2 = 0;
     integrand.iroff3 = 0;
-    integrand.noext = 1;
+    integrand.noext = 0;
     integrand.extrap = 0;
     /* Allocate device side memory and storing struct for reusable memory */
     Subintegral* d_list;    cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED); device.list = d_list;
@@ -209,6 +210,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             break;
     }
 
+
     /* Set final results and error */
 	if (epsilerror == DBL_MAX) { //if no extrapolation was necissary, set values
 		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
@@ -243,7 +245,9 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
 			else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
 				flagError(&integrand, DIVERGENT);
 			    setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
-			}
+            }
+            else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+
 			return;
 		}
         else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
@@ -347,7 +351,6 @@ __global__ void dqk15i(Subintegral*, Result*, int, int, int, int*, double*, doub
 __global__ void checkError(Integrand*, Result*, int, int*);
 __global__ void skimValues(Subintegral*, Result*, int, int*, double, double, double*);
 __global__ void fixindex(int*);
-__global__ void printlist(Device);
 void updateEvaluations(int*, int*, int);
 
 void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index, double abserr_thresh, double relerr_thresh, double* errorsum, double* resultsum)
@@ -368,9 +371,10 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
 
     /* Check round off error */
     checkError <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
+
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
-    skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult); //kernel problem here
+    skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
     fixindex <<<1,1>>> (device.index);
 
     /* Copy results necissary to the CPU side */
@@ -378,8 +382,6 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemcpy(integrand, device.integrand, sizeof(Integrand), cudaMemcpyDeviceToHost);
     cudaMemcpy(resultsum, device.totalresult, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(errorsum, device.totalerror, sizeof(double), cudaMemcpyDeviceToHost);
-    //printlist <<<1,1>>> (device);
-    //printf("\n");
 
     /* Set total evaluations */
     integrand->currentevals = currentevals;
@@ -901,7 +903,7 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
             slist = alloclist(list, nindex, slength);
             /* Place intervals that aren't skimmed into global */
             while (slength > 0) {
-                if (!nslist[length].skimmed) {
+                if (!nslist[length - 1].skimmed) {
                     slist[slength - 1] = nslist[length - 1];
                     slength--;
                 }
@@ -1033,6 +1035,13 @@ __device__ int checkRoundOff(Subintegral* results, int num)
     return 1;
 }
 
+/*
+    Checks for bad integral behavior.
+
+    Parameters:
+        results - list of calculated intervals
+        num - amount of intervals
+*/
 __device__ int checkBehavior(Subintegral* results, int num)
 {
     double a; //Left bound being evaluated
@@ -1071,7 +1080,7 @@ __device__ Subintegral* alloclist(Subintegral* list, int* index, int amount)
 }
 
 /*
-    Function used to preform addition atomically with
+    Function used to perform addition atomically with
     double precision.
     Parameters:
         address - pointer to memory address of double to be incremented
@@ -1089,6 +1098,14 @@ __device__ double atomicAddDbl(double* address, double val)
     return __longlong_as_double(old);
 }
 
+/*
+    Function used to perfrom additon along with multiplication
+    using fused multiply add to increase performance.
+    Parameters:
+        address - pointer to memory addres to be incremented
+        a - value multiplied by b then added
+        b - value multiplied by a then added
+*/
 __device__ double atomicAddFma(double* address, double a, double b)
 {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -1100,6 +1117,12 @@ __device__ double atomicAddFma(double* address, double a, double b)
     } while (assumed != old);
     return __longlong_as_double(old);
 }
+
+/**********************************************/
+/**********************************************/
+/************DEVICE/HOST FUNCTIONS*************/
+/**********************************************/
+/**********************************************/
 
 /*
     Function turns on bits to flag errors over
