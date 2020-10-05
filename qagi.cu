@@ -4,7 +4,7 @@
 #define NEGATIVE_INF -1 //(-inf, b)
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
-#define MAX_ITERATIONS 50 //Number of cycles allowed before quit
+#define MAX_ITERATIONS 400 //Number of cycles allowed before quit
 #define MAX_SUBINTERVALS_ALLOWED 1000
 #define MAX_EXTRADIVISIONS_ALLOWED 10
 
@@ -98,7 +98,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     integrand.iroff1 = 0;
     integrand.iroff2 = 0;
     integrand.iroff3 = 0;
-    integrand.noext = 0;
+    integrand.noext = 1;
     integrand.extrap = 0;
     /* Allocate device side memory and storing struct for reusable memory */
     Subintegral* d_list;    cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED); device.list = d_list;
@@ -125,20 +125,18 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     /* Test of accuracy */
     errorbound = _max(abserror_thresh, relerror_thresh * _abs(resultsum));
 
-    if (errorsum <= 100 * DBL_EPSILON * resabs && errorbound < errorsum) //checks if round off error and if the error is above threshhold
-                flagError(&integrand, ROUNDOFF_ERROR);
-        if (iterations == MAX_ITERATIONS - 1)
-                flagError(&integrand, MAX_ITERATIONS);
-        if (integrand.ier != NORMAL || (errorsum <= errorbound && errorsum != resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
-                *result = resultsum;
-                *evaluations = integrand.currentevals;
-                *abserror = errorsum;
-                return;
-        }
-        if ((1 - DBL_EPSILON / 2) * resabs <= _abs(resultsum))
-                signchange = 0;
-        else
-                signchange = 1;
+    if (errorsum <= 100 * DBL_EPSILON * resabs && errorbound < errorsum) //checks if round off error and if also below threshhold
+        flagError(&integrand, ROUNDOFF_ERROR);
+    if (iterations == MAX_ITERATIONS)
+        flagError(&integrand, MAX_ITERATIONS);
+    if (integrand.ier != NORMAL || (errorsum <= errorbound && errorsum != resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
+        setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+        return;
+    }
+    if ((1 - DBL_EPSILON / 2) * resabs <= _abs(resultsum))
+        signchange = 0;
+    else
+        signchange = 1;
         
     /* Start disecting interval */
 
@@ -155,7 +153,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     epsiltable.list[0] = resultsum;
     ktmin = 0;
 
-    for (iterations = 2; iterations < MAX_ITERATIONS; iterations++) {
+    for (iterations = 2; iterations < MAX_ITERATIONS+1; iterations++) {
 
         /* Start Waterfall Quadrature */
         wqk15i(device, &integrand, bound, inf, &index, abserror_thresh, relerror_thresh, &errorsum, &resultsum);
@@ -349,6 +347,7 @@ __global__ void dqk15i(Subintegral*, Result*, int, int, int, int*, double*, doub
 __global__ void checkError(Integrand*, Result*, int, int*);
 __global__ void skimValues(Subintegral*, Result*, int, int*, double, double, double*);
 __global__ void fixindex(int*);
+__global__ void printlist(Device);
 void updateEvaluations(int*, int*, int);
 
 void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index, double abserr_thresh, double relerr_thresh, double* errorsum, double* resultsum)
@@ -371,7 +370,7 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     checkError <<<oindex + 1, 1>>> (device.integrand, device.result, oindex, device.index);
     /* Skim results */
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
-    skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
+    skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult); //kernel problem here
     fixindex <<<1,1>>> (device.index);
 
     /* Copy results necissary to the CPU side */
@@ -379,6 +378,9 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemcpy(integrand, device.integrand, sizeof(Integrand), cudaMemcpyDeviceToHost);
     cudaMemcpy(resultsum, device.totalresult, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(errorsum, device.totalerror, sizeof(double), cudaMemcpyDeviceToHost);
+    //printlist <<<1,1>>> (device);
+    //printf("\n");
+
     /* Set total evaluations */
     integrand->currentevals = currentevals;
 }
@@ -648,8 +650,8 @@ __global__ void dqk15i(Subintegral* list, Result* rlist, int bound, int inf, int
         /* Improve previous approximations to integral and error and test for accuracy  */
         totresult = sumResults(memindex, divisions);
         toterror = sumError(memindex, divisions);
-     atomicAddDbl(errorsum, toterror - original.error);
-     atomicAddDbl(resultsum, totresult - original.result);
+        atomicAddDbl(errorsum, toterror - original.error);
+        atomicAddDbl(resultsum, totresult - original.result);
         /* Append results to interfunctional list */
         rlist[tindex].original = original;
         rlist[tindex].results = memindex;
@@ -951,6 +953,12 @@ __global__ void fixindex(int* index) {
         (*index)--;
 }
 
+__global__ void printlist(Device device)
+{
+    for (int i = 0; i <= *(device.index); i++)
+        printf("Result %f, Error %f\n", device.list[i].result, device.list[i].error);
+}
+
 
 
 /**********************************************/
@@ -1133,7 +1141,7 @@ int main()
     int evaluations;
     int ier;
 
-    qagi(0, BOTH_INF, 0, 0, &result, &abserror, &evaluations, &ier);
+    qagi(0, BOTH_INF, 1.49e-8, 1.49e-8, &result, &abserror, &evaluations, &ier);
 
     printf("Results: %f\nError: %f\nEvaluations: %d\n", result, abserror, evaluations);
     printError(ier);
