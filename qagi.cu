@@ -5,7 +5,7 @@
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 1000 //Number of cycles allowed before quit
-#define MAX_SUBINTERVALS_ALLOWED 200
+#define MAX_SUBINTERVALS_ALLOWED 1000
 #define MAX_EXTRADIVISIONS_ALLOWED 20
 
 enum {
@@ -59,7 +59,7 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  pow(sin(x)/x,2);//1 / (1 + x * x);
+    return  exp(x)/(exp(x) + x*x);
 }
 
 void setvalues(Integrand*, double, double, int, double*, double*, int*, int*);
@@ -217,6 +217,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     cudaFree(d_results);
     cudaFree(d_toterror);
     cudaFree(d_totresult); 
+
     /* Set final results and error */
 	if (epsilerror == DBL_MAX) { //if no extrapolation was necissary, set values
 		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
@@ -563,7 +564,6 @@ void setvalues(Integrand* integrand, double resultsum, double errorsum, int inf,
 void printError(int ier)
 {
     int mask = 1;
-    int errors = 0;
     if (ier == 0)
         printf("NORMAL\n");
     else {
@@ -595,8 +595,6 @@ void printError(int ier)
         }
     }
 }
-
-
 
 /**********************************************/
 /**********************************************/
@@ -919,6 +917,29 @@ __global__ void skimValues(Subintegral* list, Result* results, int oindex, int* 
     }
 }
 
+
+/*
+    Uses quicksort in parallel and with recursive kernels.
+
+    Parameters:
+        low - position of lowest index
+        high - position of highest index
+        list - device side list of subintegrals
+*/
+
+__device__ int partition(int low, int high, Subintegral* list);
+
+__global__ void quicksort(int low, int high, Subintegral* list)
+{
+	int part;
+	if (low < high)
+	{
+		part = partition(low, high, list);
+		quicksort <<<1,1>>> (low, part, list);
+		quicksort <<<1,1>>> (part+1, high, list);
+	}
+}
+
 /*
     Kernel used to set the reuseable device memory of
     totalerror and totalresults to the result and error
@@ -1123,6 +1144,38 @@ __device__ double atomicAddFma(double* address, double a, double b)
     return __longlong_as_double(old);
 }
 
+/*
+    Algorithm used to partition the quicksort
+
+    Parameters:
+        low - lowest index
+        high - highest index
+        list - list of device sided integrals
+*/
+__device__ int partition(int low, int high, Subintegral * list)
+{
+	Subintegral temp;
+	double pivot = list[low].error;
+	int i = low, j = high+1;
+	while (i < j)
+	{
+		while (list[++i].error >= pivot && i < high)
+			;
+		while (list[--j].error <= pivot && j > low)
+			;
+		if (i < j) {
+			temp = list[i];
+			list[i] = list[j];
+			list[j] = temp;
+		}
+	}
+	temp = list[low];
+	list[low] = list[j];
+	list[j] = temp;
+
+	return j;
+}
+
 /**********************************************/
 /**********************************************/
 /************DEVICE/HOST FUNCTIONS*************/
@@ -1169,7 +1222,7 @@ int main()
     int evaluations;
     int ier;
 
-    qagi(0, BOTH_INF, 1.49e-8, 1.49e-8, &result, &abserror, &evaluations, &ier);
+    qagi(0, POSITIVE_INF, 1.49e-8, 1.49e-8, &result, &abserror, &evaluations, &ier);
 
     printf("Results: %f\nError: %f\nEvaluations: %d\n", result, abserror, evaluations);
     printError(ier);
