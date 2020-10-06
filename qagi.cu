@@ -5,8 +5,8 @@
 #define POSITIVE_INF 1 //(a, inf)
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 1000 //Number of cycles allowed before quit
-#define MAX_SUBINTERVALS_ALLOWED 5000
-#define MAX_EXTRADIVISIONS_ALLOWED 10
+#define MAX_SUBINTERVALS_ALLOWED 200
+#define MAX_EXTRADIVISIONS_ALLOWED 20
 
 enum {
     NORMAL, MAX_ITERATIONS_ALLOWED = 0x1, ROUNDOFF_ERROR = 0x2, BAD_INTEGRAND_BEHAVIOR = 0x4,
@@ -100,7 +100,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     integrand.iroff2 = 0;
     integrand.iroff3 = 0;
     integrand.noext = 0;
-    integrand.extrap = 0;
+    integrand.extrap = 1;
     /* Allocate device side memory and storing struct for reusable memory */
     Subintegral* d_list;    cudaMalloc((void**)&d_list, sizeof(Subintegral) * MAX_SUBINTERVALS_ALLOWED); device.list = d_list;
     Result* d_results;      cudaMalloc((void**)&d_results, sizeof(Result) * MAX_SUBINTERVALS_ALLOWED);   device.result = d_results;
@@ -210,7 +210,13 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             break;
     }
 
-
+    printlist <<<1,1>>>(device);
+    cudaFree(d_index);
+    cudaFree(d_integrand);
+    cudaFree(d_list);  
+    cudaFree(d_results);
+    cudaFree(d_toterror);
+    cudaFree(d_totresult); 
     /* Set final results and error */
 	if (epsilerror == DBL_MAX) { //if no extrapolation was necissary, set values
 		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
@@ -958,7 +964,7 @@ __global__ void fixindex(int* index) {
 __global__ void printlist(Device device)
 {
     for (int i = 0; i <= *(device.index); i++)
-        printf("Result %f, Error %f\n", device.list[i].result, device.list[i].error);
+        printf("Result %.9f, Error %.9f\n", device.list[i].result, device.list[i].error);
 }
 
 
@@ -980,13 +986,12 @@ __global__ void printlist(Device device)
         extrallowed - extra divisions allowed after minimum of two are allowed
 */
 __device__ int findDivisions(double error, double errorsum, int index, int extrallowed) {
-    int extraspace; //how much extra space is left
-
-    /*extraspace = MAX_SUBINTERVALS_ALLOWED - ((index+1) * 2 + extrallowed);
-    extrallowed = (extraspace >= 0) ? extrallowed : extrallowed + extraspace;
+    int extraspace; //Extra space left in list
+    
+    extraspace = MAX_SUBINTERVALS_ALLOWED - ((index+1) * 2);
+    /* If extraspace left in list is less than extrallow, modify extrallowed */
+    extrallowed = _min(extraspace, extrallowed);
     return (int)((error / errorsum) * extrallowed) + 2; //Gives out a default of 2 threads and gives excess to intervals with high error
-    */
-    return 2;
 }
 
 /*
