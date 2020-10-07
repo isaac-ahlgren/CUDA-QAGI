@@ -6,7 +6,7 @@
 #define BOTH_INF 2 //(-inf, inf)
 #define MAX_ITERATIONS 1000 //Number of cycles allowed before quit
 #define MAX_SUBINTERVALS_ALLOWED 1000
-#define MAX_EXTRADIVISIONS_ALLOWED 20
+#define MAX_EXTRADIVISIONS_ALLOWED 0
 
 enum {
     NORMAL, MAX_ITERATIONS_ALLOWED = 0x1, ROUNDOFF_ERROR = 0x2, BAD_INTEGRAND_BEHAVIOR = 0x4,
@@ -59,7 +59,7 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return  exp(x)/(exp(x) + x*x);
+    return (1  + 2*x) * exp(-x);
 }
 
 void setvalues(Integrand*, double, double, int, double*, double*, int*, int*);
@@ -153,6 +153,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     epsilerror = DBL_MAX;
     epsiltable.list[0] = resultsum;
     ktmin = 0;
+    correc = 0;
 
     for (iterations = 2; iterations < MAX_ITERATIONS+1; iterations++) {
 
@@ -167,6 +168,9 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
         if ((index+1) * 2 >= MAX_SUBINTERVALS_ALLOWED)
             flagError(&integrand, NO_SPACE);
         
+        if (index < 0)
+            printf("%d\n", iterations);
+
         if (errorsum <= errorbound) { //If error is under requested threshhold, add up all results and end program
             setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
             return;
@@ -210,7 +214,6 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             break;
     }
 
-    printlist <<<1,1>>>(device);
     cudaFree(d_index);
     cudaFree(d_integrand);
     cudaFree(d_list);  
@@ -364,6 +367,7 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
 {
     int currentevals; //Current evaluations
     int oindex; //Original index before quadrature
+    cudaError_t error;
 
     oindex = *index;
     currentevals = integrand->currentevals;
@@ -374,6 +378,12 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     dqk15i <<<oindex + 1, 1>>> (device.list, device.result, bound, inf, oindex, device.index, device.totalerror, device.totalresult);
     fixindex <<<1,1>>> (device.index);
 
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("%s %d\n", cudaGetErrorString(error), oindex);
+        exit(1);
+    }
+
     updateEvaluations(device.index, &currentevals, inf);
 
     /* Check round off error */
@@ -383,6 +393,12 @@ void wqk15i(Device device, Integrand* integrand, int bound, int inf, int* index,
     cudaMemset(device.index, 0, sizeof(int)); //Resets device index for allocating memory
     skimValues <<<oindex + 1, 1>>> (device.list, device.result, oindex, device.index, abserr_thresh, relerr_thresh, device.totalresult);
     fixindex <<<1,1>>> (device.index);
+
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("%s %d\n", cudaGetErrorString(error), oindex);
+        exit(1);
+    }
 
     /* Copy results necissary to the CPU side */
     cudaMemcpy(index, device.index, sizeof(int), cudaMemcpyDeviceToHost);
