@@ -59,13 +59,14 @@ typedef struct dev {
 } Device;
 
 __device__ double f(double x) {
-    return (1  + 2*x) * exp(-x);
+    return sin(pow(x,2));//pow(sin(x)/x,2);//(1  + 2*x) * exp(-x);
 }
 
-void setvalues(Integrand*, double, double, int, double*, double*, int*, int*);
+void setvalues(Integrand*, Device, double, double, int, double*, double*, int*, int*);
 void fqk15i(Device, int, int, double*, double*, double*, double*);
 void wqk15i(Device, Integrand*, int, int, int*, double, double, double*, double*);
 void extrapolate(Epsilontable*);
+void correct(Device device, double* epsilerror);
 __host__ __device__ void flagError(Integrand*, int);
 __host__ __device__ double _max(double a, double b);
 __host__ __device__ double _min(double a, double b);
@@ -131,7 +132,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     if (iterations == MAX_ITERATIONS)
         flagError(&integrand, MAX_ITERATIONS);
     if (integrand.ier != NORMAL || (errorsum <= errorbound && errorsum != resasc) || errorsum == 0) { //ends if it has an error, within the bounds of error threshhold, or if error is zero
-        setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+        setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
         return;
     }
     if ((1 - DBL_EPSILON / 2) * resabs <= _abs(resultsum))
@@ -147,13 +148,11 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
     double epsilresult; //results calculated in epsilon table
     double ex_errorbound; //errorbound used in extrapolation
     int ktmin; //amount of times extrapolated with no decrease in error
-    double correc; //the amount of error added in total error if roundoff detected in extrapolation
 
     epsilresult = resultsum;
     epsilerror = DBL_MAX;
     epsiltable.list[0] = resultsum;
     ktmin = 0;
-    correc = 0;
 
     for (iterations = 2; iterations < MAX_ITERATIONS+1; iterations++) {
 
@@ -172,7 +171,7 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             printf("%d\n", iterations);
 
         if (errorsum <= errorbound) { //If error is under requested threshhold, add up all results and end program
-            setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+            setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
             return;
         }
 
@@ -214,34 +213,27 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
             break;
     }
 
-    cudaFree(d_index);
-    cudaFree(d_integrand);
-    cudaFree(d_list);  
-    cudaFree(d_results);
-    cudaFree(d_toterror);
-    cudaFree(d_totresult); 
-
     /* Set final results and error */
 	if (epsilerror == DBL_MAX) { //if no extrapolation was necissary, set values
-		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 		return;
 	}
 
 	if (integrand.ier == 0 && 5 > integrand.iroff2) { //if no problems arise in extrapolation, evaluate if divergent and set values
 
 		if (signchange && _max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02)
-            setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+            setvalues(&integrand, device, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
 		else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
 			flagError(&integrand, DIVERGENT);
-			setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+			setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
         }
-        else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+        else setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 
 		return;
 	}
 
 	if (5 <= integrand.iroff2) //If round off error flaged in extrapolation table, modify error
-		epsilerror += correc;
+        correct(device, &epsilerror);
 
 	if (integrand.ier == 0)
 		flagError(&integrand, ROUNDOFF_ERROR);
@@ -251,40 +243,40 @@ void qagi(double bound, int inf, double abserror_thresh, double relerror_thresh,
 		if (errorsum / _abs(resultsum) >= epsilerror / _abs(epsilresult)) {
 
 			if (signchange && max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02) 
-                setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+                setvalues(&integrand, device, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
 			else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
 				flagError(&integrand, DIVERGENT);
-			    setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+			    setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
             }
-            else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+            else setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 
 			return;
 		}
-        else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+        else setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 		
 		return;
 	}
 
 	if (errorsum < epsilerror) {
-		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 		return;
 	}
 
 	if (resultsum == 0) {
-		setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+		setvalues(&integrand, device, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
 		return;
 	}
 
 	if (signchange && _max(_abs(epsilresult), _abs(resultsum)) <= resabs * 1.0E-02) { //Test if divergent
-        setvalues(&integrand, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
+        setvalues(&integrand, device, epsilresult, epsilerror, inf, result, abserror, evaluations, ier);
         return;
 	}
 	else if (1.0E-02 > epsilresult / resultsum || (epsilresult / resultsum) > 1.0E+02 || errorsum > _abs(resultsum)) {
 		flagError(&integrand, DIVERGENT);
-		setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+		setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 		return;
     }
-    else setvalues(&integrand, resultsum, errorsum, inf, result, abserror, evaluations, ier);
+    else setvalues(&integrand, device, resultsum, errorsum, inf, result, abserror, evaluations, ier);
 
     return;
 }
@@ -563,14 +555,32 @@ void updateEvaluations(int* d_index, int* currentevals, int inf)
         inf - constant denoting which direction the integral
               is infinite
 */
-void setvalues(Integrand* integrand, double resultsum, double errorsum, int inf, double* result, double* abserror, int* evaluations, int* ier)
+void setvalues(Integrand* integrand, Device device, double resultsum, double errorsum, int inf, double* result, double* abserror, int* evaluations, int* ier)
 {
     *result = resultsum;
     *evaluations = integrand->currentevals;
     *abserror = errorsum;
     *ier = integrand->ier;
+
+    cudaFree(device.index);
+    cudaFree(device.integrand);
+    cudaFree(device.list);  
+    cudaFree(device.totalresult);
+    cudaFree(device.totalerror);
+    cudaFree(device.result); 
 }
 
+__global__ void getSmallError(Subintegral*, int*, double*);
+
+void correct(Device device, double* epsilerror)
+{
+    double smallerror; //Error over the smallest intervals
+    double* d_smallerror; //Device side of smallerror
+    cudaMalloc((void**)&d_smallerror, sizeof(double));
+    getSmallError <<<1,1>>> (device.list, device.index, d_smallerror);
+    cudaMemcpy(&smallerror, d_smallerror, sizeof(double), cudaMemcpyDeviceToHost);
+    (*epsilerror) += smallerror;
+}
 /*
     Used to print the meaning of the bit flags in ier.
 
@@ -986,6 +996,35 @@ __global__ void setInterval(Subintegral* list)
 {
     list[0].a = 0;
     list[0].b = 1;
+}
+
+/*
+    Kernel corrects epsil error if roundoff is detected.
+    
+    Parameters:
+        list - list of device sided list of subintegrals
+        index - device sided index
+        error - sum of smallest interval error
+*/
+__global__ void getSmallError(Subintegral* list, int* index, double* error)
+{
+    double minlength;
+    double smallerror;
+
+    smallerror = 0;
+    minlength = DBL_MAX;
+
+    /* Find smallest interval */
+    for (int i = 0; i < (*index); i++)
+        if (minlength > list[i].b - list[i].a)
+            minlength = list[i].b - list[i].a;
+    
+    /* Add up smallest intervals error */
+    for (int i = 0; i < (*index); i++)
+        if (minlength == list[i].b - list[i].a)
+            smallerror += list[i].result;
+    
+    *error = smallerror;
 }
 
 /*
